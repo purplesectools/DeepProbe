@@ -1,0 +1,22 @@
+Git related
+.git
+.gitignore
+
+macOS specific
+.DS_Store
+
+Python specific ignores
+.venv/
+pycache/
+*.pyc
+*.log
+*.sqlite3
+
+IDE specific ignores
+.idea/
+.vscode/
+*.swp
+
+DeepProbe specific output/input folders
+out/
+memory/

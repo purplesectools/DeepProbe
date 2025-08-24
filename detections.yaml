@@ -1,0 +1,831 @@
+# detections.yaml
+schema_version: 1.2
+
+volatility:
+  prefer: v3
+  v3_binaries: ["vol", "volatility3"]
+  v2_binaries: ["vol.py"]
+
+scoring:
+  mode: sum               # sum all matched detection weights
+  severity_bands:
+    - { label: "Informational", max: 1 } # Weight 1
+    - { label: "Low",          max: 4 } # Weight 2-4
+    - { label: "Medium",       max: 8 } # Weight 5-8
+    - { label: "High",         max: 14 } # Weight 9-14
+    - { label: "Critical",     max: 999 } # Weight 15+
+
+os_profiles:
+
+  windows:
+    plugins:
+      - { name: "windows.info",                 format: "text" }
+      - { name: "windows.pslist",               format: "csv"  }
+      - { name: "windows.psscan",               format: "csv"  }
+      - { name: "windows.psxview",              format: "csv"  }
+      - { name: "windows.pstree",               format: "txt"  } # Added for parent-child analysis
+      - { name: "windows.cmdline",              format: "csv"  } # Added for detailed command line analysis
+      - { name: "windows.netstat",              format: "csv",  fallback: ["windows.netscan"] }
+      - { name: "windows.malfind",              format: "text" }
+      - { name: "windows.hollowprocesses",      format: "text" }
+      - { name: "windows.ldrmodules",           format: "text" }
+      - { name: "windows.handles",              format: "text" }
+      - { name: "windows.svcscan",              format: "csv" } # Changed to CSV for easier parsing
+      - { name: "windows.scheduled_tasks",      format: "text", fallback: ["windows.registry.scheduled_tasks"] }
+      - { name: "windows.filescan",             format: "text" }
+      - { name: "windows.registry.printkey",    format: "text" }
+      - name: "windows.registry.userassist"
+        format: "text"
+      - name: "windows.sessions"
+        format: "csv"
+      - name: "windows.getsids"
+        format: "text"
+      # --- NEW WINDOWS PLUGINS ---
+      - { name: "windows.dlllist",              format: "csv"  }
+      - { name: "windows.apihooks",             format: "text" }
+      - { name: "windows.devicetree",           format: "text" } # For drivers/device info
+      - { name: "windows.modscan",              format: "text" } # For kernel modules
+      - { name: "windows.consoles",             format: "text" } # Command history for cmd.exe
+      - { name: "windows.clipboard",            format: "text" }
+      - { name: "windows.registry.shimcache",   format: "csv"  } # Execution evidence
+      - { name: "windows.registry.amcache",     format: "csv"  } # Execution evidence
+      - { name: "windows.envars",               format: "text" } # Environment variables
+        
+    engines:
+      - engine_id: network_enrichment
+        description: Enriches network connections with geographic and reputation data.
+
+    detections:
+
+      - id: correlation_persistence_execution
+        title: High-Confidence Threat (Persistence + Execution)
+        narrative: "This is a critical finding! Multiple clues strongly suggest an attacker has successfully gained a persistent foothold on the system and has executed malicious code. This indicates a serious compromise where the attacker can likely maintain access and access and perform further actions."
+        mitre: ["T1543.003", "T1053", "T1059", "TA0002", "T1547.001"]
+        weight: 15
+        engine: correlated_findings
+        enabled: true
+        evidence_fields: ["correlated_finding_ids"]
+        params:
+          correlation_pairs:
+            - primary_ids: ["scheduled_tasks_suspicious", "services_suspicious", "registry_run_key_persistence"]
+              secondary_ids: ["unknown_process_name", "exec_from_tmp", "filescan_suspicious_names", "suspicious_cmdline_args", "unusual_parent_child"]
+
+      - id: correlation_cred_access_injection
+        title: High-Confidence Threat (Credential Access + Injection)
+        narrative: "This finding is highly critical. A malicious program likely injected itself into a legitimate process (like LSASS) to steal user credentials. This is a crucial step for attackers to move deeper into your network or access sensitive information."
+        mitre: ["T1003.001", "T1055"]
+        weight: 15
+        engine: correlated_findings
+        enabled: true
+        evidence_fields: ["correlated_finding_ids"]
+        params:
+          correlation_pairs:
+            - primary_ids: ["handles_lsass_access"]
+              secondary_ids: ["malfind_injection", "unknown_process_name", "suspicious_cmdline_args"]
+
+      - id: correlation_evasion_network
+        title: High-Confidence Threat (Evasion + Network Activity)
+        narrative: "This is a severe threat. The attacker is actively trying to hide their malicious activities while also communicating with external servers. This strongly suggests an active 'Command and Control' (C2) channel, meaning the attacker is remotely controlling the compromised system."
+        mitre: ["T1055", "T1071", "TA0011"]
+        weight: 15
+        engine: correlated_findings
+        enabled: true
+        evidence_fields: ["correlated_finding_ids"]
+        params:
+          correlation_pairs:
+            - primary_ids: ["psxview_hidden", "malfind_injection", "ldr_unlinked_module"]
+              secondary_ids: ["suspicious_connection", "suspicious_network_enrichment", "suspicious_port_activity"]
+
+      # --- Network Related Detections (Critical - Weight: 15) ---
+      # NEW DETECTION: For Malicious Reputation
+      - id: suspicious_network_malicious_ip
+        title: Network connections to malicious IPs
+        narrative: "The system is communicating with known malicious IP addresses, which are often associated with cybercriminals or hostile infrastructure. This is a very strong sign of an active compromise, potentially for Command and Control (C2) or data theft."
+        mitre: ["T1071", "TA0011"]
+        weight: 15
+        engine: network_enrichment
+        enabled: true
+        evidence_fields: ["ip", "country", "isp", "reputation"]
+        params:
+          allow_cidrs_ref: "baseline.network.allow_cidrs"
+        logic:
+          - rule_id: malicious_reputation
+            match:
+              - field: "reputation"
+                value: "Malicious"
+                operator: "=="
+          - rule_id: suspicious_reputation
+            match:
+              - field: "reputation"
+                value: "Suspicious"
+                operator: "=="
+
+      # MODIFIED DETECTION: For Suspicious Foreign Locations
+      - id: suspicious_network_enrichment # Keep this ID, but adjust logic for country only
+        title: Network connections to suspicious foreign locations
+        narrative: "The system is communicating with IP addresses located in countries identified as suspicious. While not inherently malicious, traffic to these locations can indicate unauthorized activity, data exfiltration, or communication with command and control infrastructure in high-risk regions."
+        mitre: ["T1071", "TA0011"]
+        weight: 15
+        engine: network_enrichment
+        enabled: true
+        evidence_fields: ["ip", "country", "isp", "reputation"]
+        params:
+          allow_cidrs_ref: "baseline.network.allow_cidrs"
+        logic:
+          # Each country is now a separate rule_id, so they are OR'd by the engine
+          - rule_id: suspicious_location_ru
+            match:
+              - field: country
+                value: "RU"
+          - rule_id: suspicious_location_cn
+            match:
+              - field: country
+                value: "CN"
+          - rule_id: suspicious_location_kp
+            match:
+              - field: country
+                value: "KP"
+          - rule_id: suspicious_location_fr
+            match:
+              - field: country
+                value: "FR"
+          - rule_id: suspicious_location_be
+            match:
+              - field: country
+                value: "BE"
+          - rule_id: suspicious_location_ir
+            match:
+              - field: country
+                value: "IR"
+          - rule_id: suspicious_location_cu
+            match:
+              - field: country
+                value: "CU"
+
+
+      - id: suspicious_connection
+        title: Suspicious external connection (non-whitelisted)
+        narrative: "An unexpected network connection to a server outside your trusted network was found. This could indicate an an attacker communicating with a remote server for control, data exfiltration, or downloading more malicious tools."
+        mitre: ["T1071", "TA0011"]
+        weight: 15
+        engine: suspicious_connection
+        enabled: true
+        evidence_fields: ["pid","owner","ForeignAddr","ForeignPort","LocalAddr","LocalPort","State"]
+        params:
+          allow_cidrs_ref: "baseline.network.allow_cidrs"
+          allow_ports_ref: "baseline.network.allow_ports"
+          plugin_preference: ["windows.netstat", "windows.netscan"]
+
+      - id: suspicious_port_activity
+        title: Suspicious port activity (known bad ports)
+        narrative: "Network connections are using ports that are commonly associated with malware, backdoors, or unauthorized communication. Attackers often use non-standard or obscure ports to evade detection."
+        mitre: ["T1071", "TA0011"]
+        weight: 15
+        engine: suspicious_port_activity
+        enabled: true
+        evidence_fields: ["pid", "owner", "Proto", "LocalPort", "ForeignPort"]
+        params:
+          suspicious_ports:
+            - 31337
+            - 4444
+            - 1337
+            - 8888
+            - 9999
+            - 10000
+            - 6881
+            - 6969
+            - 2222
+      
+      # --- Confirmed Detections (High - Weight: 10) ---
+      - id: psxview_hidden
+        title: Hidden or unlinked process (psxview mismatch)
+        narrative: "A running program is actively attempting to hide its presence from standard system monitoring tools. This is a strong indicator of rootkit activity or other advanced evasion techniques used by malware to remain undetected."
+        mitre: ["T1055", "T1068"]
+        weight: 10
+        engine: psxview_hidden
+        enabled: true
+        evidence_fields: ["pid","name","pslist","psscan","thrdscan","csrss"]
+
+      - id: handles_lsass_access
+        title: LSASS access by non-system process (credential dumping)
+        narrative: "A program that is not part of the core operating system is accessing sensitive memory belonging to the Local Security Authority Subsystem Service (LSASS). This is highly indicative of an attempt to steal user credentials (usernames and passwords), which attackers use to move laterally in a network."
+        mitre: ["T1003.001"]
+        weight: 10
+        engine: handles_dangerous_access
+        enabled: true
+        evidence_fields: ["requestor_pid","requestor_name","target_pid","target_name","GrantedAccess"]
+        params:
+          target_process_regex: "(?i)^lsass\\.exe$"
+          access_regex: "(?i)(PROCESS_VM_(READ|WRITE)|PROCESS_VM_OPERATION|PROCESS_QUERY_(INFORMATION|LIMITED_INFORMATION)|WRITE_DAC|WRITE_OWNER|DUP_HANDLE)"
+
+      - id: malfind_injection
+        title: Code injection indicators (malfind)
+        narrative: "Malicious code or shellcode was found secretly injected into the memory space of a legitimate program. This is a common technique used by malware to execute hidden code, bypass security controls, and often to perform stealthy actions without being detected."
+        mitre: ["T1055"]
+        weight: 10
+        engine: malfind_injection
+        enabled: true
+        evidence_fields: ["pid","process","Start","Protection","PrivateMemory","Notes"]
+        params:
+          keywords: ["mimikatz", "invoke-mimikatz", "meterpreter", "cobalt", "beacon", "powershell -enc"]
+
+      - id: hollowed_process
+        title: Hollowed process detected
+        narrative: "A legitimate program (process) has had its original memory content entirely replaced with malicious code. This technique, known as 'process hollowing,' is used by advanced malware to disguise itself as a trusted process and evade detection."
+        mitre: ["T1055.012"]
+        weight: 10
+        engine: hollowed_process
+        enabled: true
+        evidence_fields: ["pid","process","Details"]
+        params:
+          keywords: ["svchost.exe", "explorer.exe"]
+
+      - id: ldr_unlinked_module
+        title: Unlinked or mapped module anomaly (LdrModules)
+        narrative: "A loaded program component (DLL or module) is hidden from standard system lists or loaded in an unusual way. This is a common tactic for stealthy code execution and evasion by malware, making it harder for security tools to see what's running."
+        mitre: ["T1055", "T1574"]
+        weight: 10
+        engine: ldr_unlinked_module
+        enabled: true
+        evidence_fields: ["pid","process","Base","Path","InLoad","InInit","InMem"]
+        params:
+          temp_like_paths:
+            - "\\\\temp\\\\"
+            - "\\\\appdata\\\\"
+            - "\\\\users\\\\[^\\\\]+\\\\downloads\\\\"
+            - "\\\\recycle"
+
+      # --- Probable Detections (Medium - Weight: 5) ---
+      - id: suspicious_cmdline_args
+        title: Process with suspicious command-line arguments
+        narrative: "A program is running with unusual or encoded instructions (command-line arguments). These arguments are often used by malware for stealthy execution, to download additional tools, or to bypass security features without being easily recognized."
+        mitre: ["T1059", "T1036"] # Execution, Masquerading
+        weight: 5
+        engine: suspicious_cmdline
+        enabled: true
+        evidence_fields: ["pid", "name", "command_line"]
+        params:
+          suspicious_keywords:
+            - "-enc" # PowerShell encoded command
+            - "-nop" # PowerShell NoProfile
+            - "-w hidden" # Hidden window
+            - "IEX" # Invoke-Expression
+            - "Invoke-" # Common for PowerShell scripts
+            - "powershell.exe -c"
+            - "cmd.exe /c"
+            - "regsvr32 /s /u /i:" # For Squiblydoo
+            - "mshta.exe" # For HTML Application attacks
+            - "[System.Convert]::FromBase64String"
+            - "http://" # Suspicious direct HTTP downloads
+            - "https://" # Suspicious direct HTTPS downloads
+            - "/c " # Generic cmd.exe execution
+            - "bitsadmin /transfer" # BITSAdmin for downloads
+            - "wmic process call create" # WMIC for process creation
+
+      - id: registry_run_key_persistence
+        title: Suspicious entry in Run/RunOnce registry keys
+        narrative: "An unusual program is configured to automatically launch every time the system starts up or a user logs in. This is a very common method used by malware to maintain persistent access and ensure it runs after a reboot."
+        mitre: ["T1547.001", "T1059"] # Boot or Logon Autostart Execution, Command and Scripting Interpreter
+        weight: 5
+        engine: registry_printkey_matches
+        enabled: true
+        evidence_fields: ["Key", "Name", "Decoded"]
+        params:
+          keys:
+            - 'Software\\Microsoft\\Windows\\CurrentVersion\\Run'
+            - 'Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce'
+            - 'Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run'
+            - 'Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows\\Run'
+            - 'Software\\Microsoft\\Windows\\CurrentVersion\\RunServices'
+            - 'Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run' # Added for 32-bit apps on 64-bit systems
+            - 'Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce' # Added for 32-bit apps on 64-bit systems
+          value_regex: "(?i)(exe|dll|js|vbs|ps1|bat|cmd|hta|py|vbe|jse)" # Look for common executable/script extensions
+
+      - id: unknown_process_name
+        title: Unknown process image (not in baseline)
+        narrative: "A program is running on the system that is not recognized as a standard or approved process from your baseline. This could indicate the presence of unauthorized software, malware, or a custom tool deployed by an attacker."
+        mitre: ["T1059", "TA0002"]
+        weight: 5
+        engine: unknown_process_name
+        enabled: true
+        evidence_fields: ["pid","name","path"]
+        params:
+          process_whitelist_ref: "baseline.process_whitelist"
+
+      - id: unusual_parent_child
+        title: Suspicious parent–child process relationship
+        narrative: "A command shell process (cmd.exe) was launched by a parent process other than the standard Windows explorer.exe or other common shells. This could indicate malicious activity, such as an attacker executing commands directly from a compromised application or a service, bypassing standard user interaction."
+        mitre: ["T1059.003", "T1059.004"]
+        weight: 5
+        engine: parent_child_analysis
+        enabled: true
+        evidence_fields: ["parent_name", "parent_pid", "child_name", "child_pid", "command_line"]
+        params:
+          child_process: "cmd.exe"
+          known_good_parents:
+            - "explorer.exe"
+            - "cmd.exe"
+            - "powershell.exe"
+            - "wscript.exe"
+            - "cscript.exe"
+            - "taskeng.exe"
+            - "setup.exe"
+            - "msiexec.exe"
+
+      - id: services_suspicious
+        title: Suspicious service ImagePath (user-writable path or unknown)
+        narrative: "A system service is configured to run its executable from a suspicious, user-writable, or unusual location. This is a common method for malware to establish persistence and ensure it starts with the system, often disguised as a legitimate service."
+        mitre: ["T1543.003", "T1053"]
+        weight: 5
+        engine: services_suspicious
+        enabled: true
+        evidence_fields: ["ServiceName","ServiceType","ImagePath","Start","Pid"]
+        params:
+          temp_like_paths:
+            - "\\\\temp\\\\"
+            - "\\\\appdata\\\\"
+            - "\\\\users\\\\[^\\\\]+\\\\downloads\\\\"
+            - "\\\\programdata\\\\.*\\\\temp"
+            - "\\\\windows\\\\temp"
+            - "\\\\public\\\\"
+          # You might add keywords for suspicious service names/display names here too
+
+      - id: scheduled_tasks_suspicious
+        title: Suspicious scheduled task (script in user-writable path)
+        narrative: "A task is set to automatically run at specific times, but it launches a script or program from a suspicious or user-writable location. This is a common method for attackers to maintain persistence on a system, ensuring their malicious code is executed regularly."
+        mitre: ["T1053.005"]
+        weight: 5
+        engine: scheduled_tasks_suspicious
+        enabled: true
+        evidence_fields: ["TaskName","ImagePath","Arguments","User"]
+        params:
+          temp_like_paths:
+            - "\\\\temp\\\\"
+            - "\\\\appdata\\\\"
+            - "\\\\users\\\\[^\\\\]+\\\\downloads\\\\"
+            - "\\\\programdata\\\\.*\\\\temp"
+          risky_exts: ["js","jse","vbs","vbe","ps1","bat","cmd","hta","py","dll","exe"]
+
+      - id: userassist_suspicious
+        title: UserAssist indicates suspicious GUI-launched items
+        narrative: "Windows keeps a record of programs launched by the user through the graphical interface. This finding indicates a suspicious program (like a command prompt or PowerShell) was run directly by a user, which can suggest malicious activity or an attacker directly interacting with the system."
+        mitre: ["T1059", "T1204"]
+        weight: 5
+        engine: userassist_suspicious
+        enabled: true
+        evidence_fields: ["Path","Count","LastUpdated"]
+        params:
+          any_path_contains: ["powershell","cmd.exe","wscript","cscript","regsvr32","rundll32",".py",".vbs",".js","mshta","certutil","bitsadmin"]
+
+      - id: sessions_anomalous
+        title: Anomalous logon session or SID usage
+        narrative: "An unusual or suspicious user logon session was detected. This could indicate unauthorized access, an attacker attempting to blend in, or a legitimate account being misused for malicious purposes to move around the network."
+        mitre: ["T1078","T1550"]
+        weight: 5
+        engine: sessions_anomalous
+        enabled: true
+        evidence_fields: ["SessionId","User","AuthPackage","LogonType","Pid","Process"]
+        params:
+          suspicious_auth_packages: ["NTLM", "Negotiate", "Kerberos"]
+          ignore_users_ref: "baseline.sessions.ignore_users"
+
+      - id: filescan_suspicious_names
+        title: Suspicious files in memory (temp/downloads/deleted)
+        narrative: "Files with suspicious names or in unusual locations (like temporary folders or downloads) were found in the system's memory. This often indicates that an attacker has staged tools, scripts, or sensitive data on the system, including files that might have been deleted from disk but are still active."
+        mitre: ["T1105","T1106"]
+        weight: 2
+        engine: filescan_path_match
+        enabled: true
+        evidence_fields: ["Offset","Path"]
+        params:
+          any_path_contains:
+            - "\\\\users\\\\[^\\\\]+\\\\desktop\\\\"
+            - "\\\\temp\\\\"
+            - "\\\\appdata\\\\local\\\\temp\\\\"
+            - "\\\\downloads\\\\"
+            - "(deleted)"
+            - "\\\\programdata\\\\"
+          any_file_ext: ["py","py.txt","ps1","vbs","js","exe","bat","cmd","txt","dll","docm","xlsm","zip","rar"]
+          any_name_contains: ["mimikatz","invoke-","meterpreter","cobalt","beacon","powershell",
+                               "vip.txt","secret","password","loot","dump","creds","nc.exe",
+                               "psexec","sccm","certutil","bitsadmin","lazagne","procdump"]
+
+      - id: registry_recentdocs_py_exe
+        title: RecentDocs shows scripts/binaries of interest
+        narrative: "Windows tracks recently accessed documents and applications. This finding shows that suspicious script or executable files were recently opened or interacted with by a user, which could indicate a user running malicious content or an attacker preparing for execution."
+        mitre: ["T1105","T1059"]
+        weight: 2
+        engine: registry_printkey_match
+        enabled: true
+        evidence_fields: ["Hive","Key","Name","Decoded"]
+        params:
+          keys:
+            - 'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs\\.py'
+            - 'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs\\.exe'
+            - 'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs\\.txt'
+            - 'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs\\.js'
+            - 'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs\\.vbs'
+            - 'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs\\.ps1'
+          value_regex: "(?i)(evil|demon|mimikatz|nc|powershell|vip\\.txt|\\.py(\\.txt)?|cobalt|beacon|c2|payload)"
+
+      - id: handles_dangerous_access
+        title: Dangerous process/thread handle access (general)
+        narrative: "A program has obtained unusually powerful or dangerous access rights to another running program or its internal components. This could mean it's trying to manipulate or inject code into a legitimate process, which is a common technique for malware to hide or elevate privileges."
+        mitre: ["T1055", "T1106"]
+        weight: 2
+        engine: handles_dangerous_access
+        enabled: true
+        evidence_fields: ["requestor_pid","requestor_name","target_pid","target_name","GrantedAccess"]
+        params:
+          access_regex: "(?i)(WRITE_DAC|WRITE_OWNER|DELETE|PROCESS_VM_WRITE|PROCESS_VM_OPERATION|PROCESS_QUERY_(INFORMATION|LIMITED_INFORMATION)|THREAD_SET_CONTEXT)"
+
+      - id: dumpit_present
+        title: Memory acquisition tool present (informational)
+        narrative: "A memory acquisition tool (like DumpIt or WinPMEM) was detected on the system. While these tools are legitimate for forensic purposes, attackers can also use them to collect sensitive data (like credentials) from memory for later analysis."
+        mitre: ["TA0007"]
+        weight: 12
+        engine: filescan_path_match
+        enabled: true
+        evidence_fields: ["Offset","Path"]
+        params:
+          any_name_contains: ["dumpit.exe","winpmem","ramcapture","fmem"]
+
+  linux:
+    plugins:
+      - { name: "linux.pslist",          format: "csv"  }
+      - { name: "linux.psscan",          format: "csv"  }
+      - { name: "linux.psaux",           format: "text" }
+      - { name: "linux.lsof",            format: "text" }
+      - { name: "linux.sockstat",        format: "text" }
+      - { name: "linux.check_syscall",   format: "text" }
+      - { name: "linux.check_modules",   format: "text" }
+      - { name: "linux.bash",            format: "text" }
+      # --- NEW LINUX PLUGINS ---
+      - { name: "linux.envars",          format: "text" } # Environment variables
+      - { name: "linux.librarylist",     format: "text" } # Loaded libraries
+      - { name: "linux.lsmod",           format: "text" } # Kernel modules
+
+    detections:
+      - id: suspicious_network_malicious_ip # NEW DETECTION ID
+        title: Network connections to malicious IPs
+        narrative: "The system is communicating with known malicious IP addresses, which are often associated with cybercriminals or hostile infrastructure. This is a very strong sign of an active compromise, potentially for Command and Control (C2) or data theft."
+        mitre: ["T1071", "TA0011"]
+        weight: 15
+        engine: network_enrichment
+        enabled: true
+        evidence_fields: ["ip", "country", "isp", "reputation"]
+        params:
+          allow_cidrs_ref: "baseline.network.allow_cidrs"
+        logic:
+          - rule_id: malicious_reputation
+            match:
+              - field: "reputation"
+                value: "Malicious"
+                operator: "=="
+          - rule_id: suspicious_reputation
+            match:
+              - field: "reputation"
+                value: "Suspicious"
+                operator: "=="
+
+      - id: suspicious_network_enrichment # MODIFIED LOGIC
+        title: Network connections to suspicious foreign locations
+        narrative: "The system is communicating with IP addresses located in countries identified as suspicious. While not inherently malicious, traffic to these locations can indicate unauthorized activity, data exfiltration, or communication with command and control infrastructure in high-risk regions."
+        mitre: ["T1071", "TA0011"]
+        weight: 15
+        engine: network_enrichment
+        enabled: true
+        evidence_fields: ["ip", "country", "isp", "reputation"]
+        params:
+          allow_cidrs_ref: "baseline.network.allow_cidrs"
+        logic:
+          # Each country is now a separate rule_id, so they are OR'd by the engine
+          - rule_id: suspicious_location_ru
+            match:
+              - field: country
+                value: "RU"
+          - rule_id: suspicious_location_cn
+            match:
+              - field: country
+                value: "CN"
+          - rule_id: suspicious_location_kp
+            match:
+              - field: country
+                value: "KP"
+          - rule_id: suspicious_location_fr
+            match:
+              - field: country
+                value: "FR"
+          - rule_id: suspicious_location_be
+            match:
+              - field: country
+                value: "BE"
+          - rule_id: suspicious_location_ir
+            match:
+              - field: country
+                value: "IR"
+          - rule_id: suspicious_location_cu
+            match:
+              - field: country
+                value: "CU"
+      
+      - id: suspicious_connection
+        title: Suspicious external connection
+        narrative: "An unexpected network connection to a server outside your trusted network was found. This could indicate an attacker communicating with a remote server for control, data exfiltration, or downloading more malicious tools."
+        mitre: ["T1071","TA0011"]
+        weight: 15
+        engine: suspicious_connection
+        enabled: true
+        evidence_fields: ["pid","owner","ForeignAddr","ForeignPort","LocalAddr","LocalPort","State"]
+        params:
+          allow_cidrs_ref: "baseline.network.allow_cidrs"
+          allow_ports_ref: "baseline.network.allow_ports"
+          
+      - id: suspicious_port_activity
+        title: Suspicious port activity (known bad ports)
+        narrative: "Network connections are using ports that are commonly associated with malware, backdoors, or unauthorized communication. Attackers often use non-standard or obscure ports to evade detection."
+        mitre: ["T1071", "TA0011"]
+        weight: 15
+        engine: suspicious_port_activity
+        enabled: true
+        evidence_fields: ["pid", "owner", "Proto", "LocalPort", "ForeignPort"]
+        params:
+          suspicious_ports:
+            - 31337
+            - 4444
+            - 1337
+            - 8888
+            - 9999
+            - 10000
+            - 6881
+            - 6969
+            - 2222
+      
+      - id: correlation_evasion_network
+        title: High-Confidence Threat (Evasion + Network Activity)
+        narrative: "This is a severe threat. The system shows signs that an attacker is actively trying to hide their malicious activities while also communicating with external servers. This strongly suggests an active 'Command and Control' (C2) channel, meaning the attacker is remotely controlling the compromised system."
+        mitre: ["T1055", "T1071", "TA0011"]
+        weight: 15
+        engine: correlated_findings
+        enabled: true
+        evidence_fields: ["correlated_finding_ids"]
+        params:
+          correlation_pairs:
+            - primary_ids: ["linux_hidden_process"]
+              secondary_ids: ["suspicious_connection", "suspicious_network_enrichment", "suspicious_port_activity"]
+
+      - id: linux_hidden_process
+        title: Hidden process (pslist vs psscan mismatch)
+        narrative: "A program running on the system is hidden from standard process lists, but is detected by deeper scans. This indicates potential rootkit activity or other advanced evasion techniques used by malware to operate undetected on Linux."
+        mitre: ["T1055"]
+        weight: 10
+        engine: linux_hidden_process
+        enabled: true
+        evidence_fields: ["pid","name","pslist_present","psscan_present"]
+
+      - id: linux_syscall_hooks
+        title: Potential syscall hooks detected
+        narrative: "Unauthorized modifications were detected to the system call tables (syscalls). This is a highly advanced technique often used by rootkits to intercept or redirect core operating system functions, allowing them to gain deep control and hide malicious activity."
+        mitre: ["T1014"]
+        weight: 10
+        engine: linux_syscall_hooks
+        enabled: true
+        evidence_fields: ["Syscall","HookOwner","Address","Notes"]
+
+      - id: linux_unsigned_module
+        title: Suspicious/unsigned kernel module
+        narrative: "An unsigned or unexpected program component (kernel module) is loaded directly into the Linux kernel. Kernel modules run with the highest privileges, and unsigned or unknown modules are a strong indicator of a malicious rootkit or backdoor designed to deeply compromise the system."
+        mitre: ["T1014"]
+        weight: 10
+        engine: linux_unsigned_module
+        enabled: true
+        evidence_fields: ["module","reason"]
+      
+      - id: lsof_suspicious_open
+        title: Suspicious open file (deleted/tmp) with context
+        narrative: "A running program has an active connection (open file handle) to a file that has been deleted from disk or is located in a temporary directory. This often indicates that malware has staged or executed transient files, which are then deleted to avoid detection."
+        mitre: ["T1105","T1106"]
+        weight: 5
+        engine: lsof_suspicious_open
+        enabled: true
+        evidence_fields: ["pid","comm","fd","type","node","path","cmdline"]
+        params:
+          any_path_contains: ["/tmp/", "/dev/shm/", "/var/tmp/", "(deleted)"]
+          any_name_contains: ["(deleted)"]
+
+      - id: exec_from_tmp
+        title: Executable/script from /tmp or /dev/shm
+        narrative: "A program or script is running directly from a temporary directory (like `/tmp` or `/dev/shm`), which is highly unusual for legitimate applications. This is a common tactic for malware to execute itself from a non-standard and often less-monitored location."
+        mitre: ["T1204","T1036"]
+        weight: 12
+        engine: exec_from_tmp
+        enabled: true
+        evidence_fields: ["pid","name","path"]
+        params:
+          temp_like_paths: ["/tmp/", "/dev/shm/", "/var/tmp/", "/home/[^/]+/Downloads/"]
+
+      - id: bash_history_suspicious
+        title: Suspicious commands in Bash history
+        narrative: "Commands that are often associated with malicious activities (e.g., downloading tools, deleting logs, privilege escalation attempts) were found in the user's Bash command history. This suggests a user, or an attacker using a user's account, has performed suspicious actions on the system."
+        mitre: ["T1059.004", "T1070.003"]
+        weight: 5
+        engine: bash_history_grep
+        enabled: true
+        evidence_fields: ["User", "Command"]
+        params:
+          suspicious_keywords:
+            - "wget"
+            - "curl"
+            - "nc "
+            - "chmod +x"
+            - "rm -rf"
+            - "shred"
+            - "python -c"
+            - "perl -e"
+            - "php -r"
+            - "cat /etc/shadow"
+            - "sudo su"
+            - "sshpass"
+            - "msfvenom"
+            - "/dev/tcp/"
+
+  macos:
+    plugins:
+      - { name: "mac.pslist",        format: "csv"  }
+      - { name: "mac.lsof",          format: "text" }
+      - { name: "mac.netstat",       format: "csv"  }
+      - { name: "mac.malfind",       format: "text" }
+      - { name: "mac.bash",          format: "text" }
+      # --- NEW MACOS PLUGINS ---
+      - { name: "mac.sessions",      format: "csv"  } # User sessions
+      - { name: "mac.mount",         format: "text" } # Mounted volumes
+      - { name: "mac.volumes",       format: "text" } # Volume information
+      - { name: "mac.dmesg",         format: "text" } # System log
+
+    detections:
+      - id: suspicious_network_malicious_ip # NEW DETECTION ID
+        title: Network connections to malicious IPs
+        narrative: "The system is communicating with known malicious IP addresses, which are often associated with cybercriminals or hostile infrastructure. This is a very strong sign of an active compromise, potentially for Command and Control (C2) or data theft."
+        mitre: ["T1071", "TA0011"]
+        weight: 15
+        engine: network_enrichment
+        enabled: true
+        evidence_fields: ["ip", "country", "isp", "reputation"]
+        params:
+          allow_cidrs_ref: "baseline.network.allow_cidrs"
+        logic:
+          - rule_id: malicious_reputation
+            match:
+              - field: "reputation"
+                value: "Malicious"
+                operator: "=="
+          - rule_id: suspicious_reputation
+            match:
+              - field: "reputation"
+                value: "Suspicious"
+                operator: "=="
+
+      - id: suspicious_network_enrichment # MODIFIED LOGIC
+        title: Network connections to suspicious foreign locations
+        narrative: "The system is communicating with IP addresses located in countries identified as suspicious. While not inherently malicious, traffic to these locations can indicate unauthorized activity, data exfiltration, or communication with command and control infrastructure in high-risk regions."
+        mitre: ["T1071", "TA0011"]
+        weight: 15
+        engine: network_enrichment
+        enabled: true
+        evidence_fields: ["ip", "country", "isp", "reputation"]
+        params:
+          allow_cidrs_ref: "baseline.network.allow_cidrs"
+        logic:
+          # Each country is now a separate rule_id, so they are OR'd by the engine
+          - rule_id: suspicious_location_ru
+            match:
+              - field: country
+                value: "RU"
+          - rule_id: suspicious_location_cn
+            match:
+              - field: country
+                value: "CN"
+          - rule_id: suspicious_location_kp
+            match:
+              - field: country
+                value: "KP"
+          - rule_id: suspicious_location_fr
+            match:
+              - field: country
+                value: "FR"
+          - rule_id: suspicious_location_be
+            match:
+              - field: country
+                value: "BE"
+          - rule_id: suspicious_location_ir
+            match:
+              - field: country
+                value: "IR"
+          - rule_id: suspicious_location_cu
+            match:
+              - field: country
+                value: "CU"
+
+      - id: suspicious_connection
+        title: Suspicious external connection
+        narrative: "An unexpected network connection to a server outside your trusted network was found. This could indicate an attacker communicating with a remote server for control, data exfiltration, or downloading more malicious tools."
+        mitre: ["T1071","TA0011"]
+        weight: 15
+        engine: suspicious_connection
+        enabled: true
+        evidence_fields: ["pid","owner","ForeignAddr","ForeignPort","LocalAddr","LocalPort","State"]
+        params:
+          allow_cidrs_ref: "baseline.network.allow_cidrs"
+          allow_ports_ref: "baseline.network.allow_ports"
+          
+      - id: suspicious_port_activity
+        title: "Suspicious port activity (known bad ports)"
+        narrative: "Network connections are using ports that are commonly associated with malware, backdoors, or unauthorized communication. Attackers often use non-standard or obscure ports to evade detection."
+        mitre: ["T1071", "TA0011"]
+        weight: 15
+        engine: suspicious_port_activity
+        enabled: true
+        evidence_fields: ["pid", "owner", "Proto", "LocalPort", "ForeignPort"]
+        params:
+          suspicious_ports:
+            - 31337
+            - 4444
+            - 1337
+            - 8888
+            - 9999
+            - 10000
+            - 6881
+            - 6969
+            - 2222
+      
+      - id: correlation_evasion_network
+        title: High-Confidence Threat (Evasion + Network Activity)
+        narrative: "This is a severe threat. The system shows signs that an attacker is actively trying to hide their malicious activities while also communicating with external servers. This strongly suggests an active 'Command and Control' (C2) channel, meaning the attacker is remotely controlling the compromised system."
+        mitre: ["T1055", "T1071", "TA0011"]
+        weight: 15
+        engine: correlated_findings
+        enabled: true
+        evidence_fields: ["correlated_finding_ids"]
+        params:
+          correlation_pairs:
+            - primary_ids: ["lsof_suspicious_open", "exec_from_tmp"]
+              secondary_ids: ["suspicious_connection", "suspicious_network_enrichment", "suspicious_port_activity"]
+
+      - id: unknown_process_name
+        title: Unknown process image (not in baseline)
+        narrative: "A program is running on the system that is not recognized as a standard or approved process from your baseline. This could indicate the presence of unauthorized software, malware, or a custom tool deployed by an attacker."
+        mitre: ["T1059","TA0002"]
+        weight: 5
+        engine: unknown_process_name
+        enabled: true
+        evidence_fields: ["pid","name","path"]
+        params:
+          process_whitelist_ref: "baseline.process_whitelist"
+
+      - id: lsof_suspicious_open
+        title: Suspicious open file (tmp/private/tmp/deleted)
+        narrative: "A running program has an active connection (open file handle) to a file that has been deleted from disk or is located in a temporary directory. This often indicates that malware has staged or executed transient files, which are then deleted to avoid detection."
+        mitre: ["T1105","T1106"]
+        weight: 5
+        engine: lsof_suspicious_open
+        enabled: true
+        evidence_fields: ["pid","comm","fd","type","node","path","cmdline"]
+        params:
+          any_path_contains: ["/tmp/", "/private/tmp/", "/var/folders/", "(deleted)"]
+
+      - id: exec_from_tmp
+        title: Executable from temporary path
+        narrative: "A program or script is running directly from a temporary directory, which is highly unusual for legitimate applications. This is a common tactic for malware to execute itself from a non-standard and often less-monitored location."
+        mitre: ["T1204","T1036"]
+        weight: 5
+        engine: exec_from_tmp
+        enabled: true
+        evidence_fields: ["pid","name","path"]
+        params:
+          temp_like_paths: ["/tmp/", "/private/tmp/", "/var/folders/", "/Users/[^/]+/Downloads/"]
+
+      - id: bash_history_suspicious
+        title: Suspicious commands in Bash history
+        narrative: "Commands that are often associated with malicious activities (e.g., downloading tools, deleting logs, privilege escalation attempts) were found in the user's Bash command history. This suggests a user, or an attacker using a user's account, has performed suspicious actions on the system."
+        mitre: ["T1059.004", "T1070.003"]
+        weight: 5
+        engine: bash_history_grep
+        enabled: true
+        evidence_fields: ["User", "Command"]
+        params:
+          suspicious_keywords:
+            - "wget"
+            - "curl"
+            - "nc "
+            - "chmod +x"
+            - "rm -rf"
+            - "shred"
+            - "python -c"
+            - "perl -e"
+            - "php -r"
+            - "cat /etc/shadow"
+            - "sudo su"
+            - "sshpass"
+            - "msfvenom"
+            - "/dev/tcp/"
+

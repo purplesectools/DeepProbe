@@ -1,0 +1,22 @@
+Python specific ignores
+.venv/
+**pycache**/
+*.pyc
+*.log
+*.sqlite3
+
+# OS specific ignores
+
+.DS_Store
+
+# IDE specific ignores
+
+.idea/
+.vscode/
+*.swp
+
+# DeepProbe specific ignores
+
+out/
+memory/
+

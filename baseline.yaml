@@ -1,0 +1,185 @@
+#
+# DeepProbe Baseline Configuration
+# This file defines normal, expected, or whitelisted entities and behaviors.
+# It is used by the analysis engines to filter out known good activity
+# before applying detection rules.
+#
+
+# --- Plugin-related definitions (for data parsing/structure, not detections) ---
+plugins:
+  - plugin_name: pslist
+    format: csv
+    rules:
+      - rule_id: hidden_process
+        description: Placeholder for pslist parsing rules
+        regex: ^(.+),(.+),(.+),(.+),(.+),(.+),(.+),(.+)
+        fields:
+          - pid
+          - ppid
+          - image_path
+          - image_name
+          - session
+          - offset
+          - create_time
+          - exit_time
+
+  - plugin_name: netscan
+    format: text
+    rules:
+      - rule_id: suspect_network_connection
+        description: Placeholder for netscan parsing rules
+        regex: ^(.+)
+        fields:
+          - pid
+          - ppid
+          - image_path
+          - image_name
+          - session
+          - offset
+          - create_time
+          - exit_time
+
+  - plugin_name: malfind
+    format: csv
+    rules:
+      - rule_id: probable_process_injection
+        description: Placeholder for malfind parsing rules
+        regex: ^(.+),(.+),(.+),(.+),(.+),(.+),(.+),(.+)
+        fields:
+          - pid
+          - ppid
+          - image_path
+          - image_name
+          - session
+          - offset
+          - create_time
+          - exit_time
+
+  - plugin_name: pecheck
+    format: text
+    rules:
+      - rule_id: pecheck_not_executable
+        description: Placeholder for pecheck parsing rules
+        regex: ^(.+),(.+),(.+),(.+),(.+),(.+),(.+),(.+)
+        fields:
+          - pid
+          - ppid
+          - image_path
+          - image_name
+          - session
+          - offset
+          - create_time
+          - exit_time
+
+# --- Whitelists for known good processes, network, and sessions ---
+process_whitelist:
+  windows:
+    - "System"
+    - "Idle"
+    - "explorer.exe"
+    - "svchost.exe"
+    - "csrss.exe"
+    - "wininit.exe"
+    - "lsass.exe"
+    - "smss.exe"
+    - "winlogon.exe"
+    - "services.exe"
+    - "dwm.exe"
+    - "conhost.exe"
+    - "taskhostw.exe"
+    - "audiodg.exe"
+    - "spoolsv.exe"
+    - "RuntimeBroker.exe"
+    - "dllhost.exe"
+    - "msedge.exe" # Example: Microsoft Edge browser
+    - "chrome.exe" # Example: Google Chrome browser
+    - "firefox.exe" # Example: Mozilla Firefox browser
+    - "mstsc.exe" # RDP client executable
+    - "RdpSa.exe" # RDP Session Agent
+    - "RDPClip.exe" # RDP Clipboard Monitor
+    # Add other common, expected processes in your environment based on observed behavior.
+    # E.g., specific antivirus processes, legitimate custom applications.
+  linux:
+    - "systemd"
+    - "init"
+    - "bash"
+    - "sshd"
+    - "gnome-shell"
+    - "Xorg"
+    # Add other common, expected Linux processes in your environment.
+  macos:
+    - "launchd"
+    - "kernel_task"
+    - "UserEventAgent"
+    - "Finder"
+    - "Dock"
+    # Add other common, expected macOS processes in your environment.
+
+network:
+  allow_cidrs:
+    - "127.0.0.0/8"    # Loopback addresses (covers 127.0.0.1)
+    - "10.0.0.0/8"     # Private network: Class A
+    - "172.16.0.0/12"  # Private network: Class B
+    - "192.168.0.0/16" # Private network: Class C
+    # Example: Common public DNS servers (if you trust them explicitly)
+    - "8.8.8.8/32"
+    - "8.8.4.4/32"
+    # Add other trusted external IP ranges if applicable (e.g., cloud provider IPs for services you use)
+  allow_ports:
+    - 53   # DNS
+    - 80   # HTTP
+    - 443  # HTTPS
+    - 21   # FTP (if used legitimately)
+    - 22   # SSH (if used legitimately)
+    - 25   # SMTP (if used legitimately)
+    - 110  # POP3 (if used legitimately)
+    - 143  # IMAP (if used legitimately)
+    - 3389 # RDP (if used legitimately)
+    # Add other common, expected ports in your environment.
+
+sessions:
+  ignore_users:
+    - "SYSTEM"
+    - "LOCAL SERVICE"
+    - "NETWORK SERVICE"
+    - "ANONYMOUS LOGON"
+    # Add other system or service accounts that should generally be ignored in session analysis.
+
+# --- NEW BASELINE SECTIONS FOR FINE-GRAINING DETECTIONS ---
+
+command_line_allowlist:
+  # RDP client (mstsc.exe) with common legitimate parameters
+  - process_name: "mstsc.exe"
+    regex: "(?i).*mstsc\\.exe(?!.*(/v:|/admin|/console|/f|/span)).*" # Whitelist mstsc.exe unless it uses suspicious full-screen/admin flags or specific target
+  - process_name: "mstsc.exe"
+    contains: "/v:your.rdp.server.com" # Whitelist connection to a specific known RDP server
+  # Add other legitimate RDP-related command lines here.
+  # For example, if you use a specific RDP client with custom arguments.
+  # - regex: ".*powershell\\.exe -EncodedCommand AQA.*" # Example: Allow specific encoded PowerShell commands (be careful with this!)
+  # - exact: "C:\\Program Files\\LegitApp\\LegitScript.cmd /silentinstall" # Example: Allow an exact command line
+  # - process_name: "CustomUpdate.exe"
+  #   contains: "-autoupdate -force" # Allow specific args for a specific process
+  # Add known legitimate command-line arguments that might otherwise trigger 'suspicious_cmdline_args'
+  # Use 'regex' for flexible matching, 'exact' for precise matches, or 'process_name' with 'contains' for process-specific rules.
+
+# parent_child_allowlist:
+#   # Example: A custom monitoring agent (parent) legitimately spawns cmd.exe (child) for checks.
+#   - parent_process_regex: "(?i)monitoragent\\.exe"
+#     child_process_regex: "(?i)cmd\\.exe"
+#   # Example: A specific business application launching an unexpected helper process.
+#   - parent_process_name: "BusinessApp.exe"
+#     child_process_name: "HelperProcess.exe"
+#   # Add known legitimate parent-child process relationships that might otherwise trigger 'unusual_parent_child'
+
+# service_path_allowlist:
+#   # Example: A legitimate custom service installed in a non-standard but approved location.
+#   - service_name: "MyCustomService"
+#     image_path_regex: "C:\\DevTools\\MyService\\service.exe"
+#   # Add specific services that are legitimately installed in paths that might be flagged as suspicious.
+
+# file_path_allowlist:
+#   # Example: A specific legitimate tool (e.g., a custom diagnostic script) found in a temporary directory.
+#   - path_regex: "C:\\Users\\Admin\\AppData\\Local\\Temp\\MyDiagnosticScript.ps1"
+#   # Add specific file paths that are known to be benign but might otherwise be flagged by 'filescan_suspicious_names'
+#   # or 'lsof_suspicious_open' (e.g., specific deleted temp files from known good applications).
+
