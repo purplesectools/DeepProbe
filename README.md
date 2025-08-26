@@ -60,7 +60,7 @@ Comprehensive Reporting: Generates detailed reports in various formats (HTML, JS
 
 Raw Artifact Access: Provides direct access to raw output files from Volatility plugins (CSV, TXT, JSON) for deeper, manual investigation.
 
-IP Enrichment: Integrates with external APIs to provide geo-location and reputation context for suspicious IP addresses found in network artifacts.
+IP Enrichment: Integrates with AbuseIPDB to provide geo-location and reputation context for suspicious IP addresses found in network artifacts.
 
 Cross-Platform Support: Analyze memory dumps from Windows, Linux, and macOS systems.
 
@@ -75,7 +75,7 @@ Detection Engine Analysis: A YAML-defined rule engine (detections.yaml, baseline
 
 Correlation Engine: This is where DeepProbe's intelligence shines. It takes individual findings and cross-references them to identify causal links and temporal relationships. For example, a hidden process, a code injection in that process, and an outbound network connection from it would be correlated into a single "Attack Chain" finding.
 
-IP Enrichment (Optional): If an API key is provided, detected external IP addresses are enriched with geo-location and reputation data.
+IP Enrichment (Optional): If an API key is provided, detected external IP addresses are enriched with geo-location and reputation data from AbuseIPDB.
 
 AI Verdict Generation (Optional): If an OpenAI API key is provided, the Gemini API is called to process the structured findings and generate a human-readable summary, key findings, attack chain narrative, and potential malware match.
 
@@ -119,7 +119,6 @@ Navigate to your project directory in the terminal and build the Docker image:
 
 docker build -t deeprobe-app .
 
-
 This command downloads the necessary Python and Debian base images, installs Volatility 3, sets up Python dependencies, and packages your DeepProbe application. This might take a few minutes for the first build.
 
 Running the Application (Securely Local)
@@ -150,7 +149,6 @@ Accessing the UI
 Once the container is running, open your web browser and navigate to:
 
 http://localhost:8501
-
 You should see the DeepProbe UI ready for use.
 
 Using DeepProbe
@@ -160,7 +158,7 @@ Configure Analysis: In the UI, enter a Project Name and the Memory File Name (e.
 
 API Keys (Optional):
 
-IP Enrichment API Key: Provide an API key for services that offer IP geo-location and reputation.
+AbuseIPDB API Key (for IP Enrichment): Provide an API key from AbuseIPDB for IP geo-location and reputation analysis.
 
 OpenAI API Key: Provide your OpenAI API key to enable AI-generated summaries and verdicts.
 
