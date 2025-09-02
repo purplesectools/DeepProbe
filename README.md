@@ -44,17 +44,7 @@ Easy configuration of analysis jobs.
 
 Real-time progress updates during scans.
 
-Rich visualization of results, including:
-
-Risk Distribution Charts: Breakdown of findings by severity (Critical, High, Medium, Low).
-
-Technique Frequency Bar Charts: Highlighting the most prevalent MITRE ATT&CK techniques.
-
-MITRE ATT&CK Heatmap: A visual overview of detected techniques mapped to ATT&CK tactics, with severity indicators.
-
-Dedicated Attack Story section for narrative-driven correlated findings.
-
-Detailed view of all detected activities with supporting evidence tables.
+Header-based navigation for quick access to core features.
 
 Comprehensive Reporting: Generates detailed reports in various formats (HTML, JSONL) for documentation and further investigation.
 
@@ -77,7 +67,6 @@ Correlation Engine: This is where DeepProbe's intelligence shines. It takes indi
 
 IP Enrichment (Optional): If an API key is provided, detected external IP addresses are enriched with geo-location and reputation data from AbuseIPDB.
 
-AI Verdict Generation (Optional): If an OpenAI API key is provided, the Gemini API is called to process the structured findings and generate a human-readable summary, key findings, attack chain narrative, and potential malware match.
 
 Report Generation: All findings, correlations, and AI insights are compiled into an interactive Streamlit UI and comprehensive output files.
 
@@ -117,8 +106,9 @@ An empty out/ subdirectory (create this if it doesn't exist)
 Building the Docker Image
 Navigate to your project directory in the terminal and build the Docker image:
 
-docker build -t deeprobe-app .
+Bash
 
+docker build -t deeprobe-app .
 This command downloads the necessary Python and Debian base images, installs Volatility 3, sets up Python dependencies, and packages your DeepProbe application. This might take a few minutes for the first build.
 
 Running the Application (Securely Local)
@@ -126,15 +116,17 @@ To run DeepProbe and access it securely from your local machine (browser), follo
 
 Create an Isolated Docker Network: This provides an additional layer of network isolation for your container.
 
-docker network create isolated-net
+Bash
 
+docker network create isolated-net
 Run the Container on the Isolated Network: This command ensures the application is only accessible via localhost and not exposed on any public or network IP addresses.
+
+Bash
 
 docker run --rm --network=isolated-net -p 127.0.0.1:8501:8501 \
   -v $(pwd)/memory:/app/memory \
   -v $(pwd)/out:/app/out \
   deeprobe-app
-
 -p 127.0.0.1:8501:8501: Maps port 8501 inside the container to port 8501 on your host machine, specifically binding it to the localhost interface. This prevents external access.
 
 -v $(pwd)/memory:/app/memory: Mounts your local memory directory into the container. Place your memory dump files here.
@@ -149,6 +141,7 @@ Accessing the UI
 Once the container is running, open your web browser and navigate to:
 
 http://localhost:8501
+
 You should see the DeepProbe UI ready for use.
 
 Using DeepProbe
@@ -160,11 +153,11 @@ API Keys (Optional):
 
 AbuseIPDB API Key (for IP Enrichment): Provide an API key from AbuseIPDB for IP geo-location and reputation analysis.
 
-OpenAI API Key: Provide your OpenAI API key to enable AI-generated summaries and verdicts.
+Gemini API Key: Provide your Gemini API key to enable AI-generated summaries and verdicts.
 
 Launch Analysis: Click "Launch Analysis" to start the automated forensic scan.
 
-Review Results: Once the scan is complete, explore the "Report Summary", "Findings", and "Artifacts" tabs for detailed insights, visualizations, and AI narratives.
+Review Results: Once the scan is complete, explore the "Report Summary", "Findings", and "Artifacts" tabs for detailed insights and AI narratives. You can also review the Detections and Baseline rules via the links in the top navigation bar.
 
 Output & Reporting
 All generated analysis reports, detailed findings (JSONL), AI verdicts (JSON), and raw artifact files from Volatility plugins will be saved in the out/<PROJECT_NAME>/ directory on your host machine. This allows for offline review and integration with other tools.
@@ -173,4 +166,6 @@ Contributing
 We welcome contributions from the community! If you'd like to improve DeepProbe, please refer to our CONTRIBUTING.md (coming soon!) for guidelines on how to report bugs, suggest features, and submit pull requests.
 
 License
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the MIT License - see the 
+
+LICENSE file for details
