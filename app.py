@@ -19,6 +19,9 @@ BASE_DIR = Path(__file__).parent
 CLI_SCRIPT_PATH = BASE_DIR / "runner.py"
 MEMORY_FOLDER = BASE_DIR / "memory"
 OUTPUT_FOLDER = BASE_DIR / "out" # Base output directory
+BASELINE_FILE_PATH = BASE_DIR / "baseline.yaml"
+DETECTIONS_FILE_PATH = BASE_DIR / "detections.yaml"
+
 
 # Ensure necessary directories exist at startup.
 try:
@@ -29,6 +32,74 @@ except Exception as e:
     st.error(f"Initialization Error: DeepProbe could not create essential directories ('memory/', 'out/'). "
              f"Please verify your file system permissions in the directory where you are running the app. Error: {e}")
     st.stop()
+
+# --- Custom CSS Fixes ---
+# This CSS removes the Streamlit header and its associated spacing, and also the default top padding.
+st.markdown(
+    """
+    <style>
+    /* Remove Streamlit default padding */
+    .block-container {
+        padding-top: 0rem;
+    }
+
+    /* Hide Streamlit top header (Deploy, hamburger menu, etc.) */
+    header[data-testid="stHeader"] {
+        display: none;
+    }
+
+    /* Also hide empty space left by toolbar */
+    div[data-testid="stDecoration"] {
+        display: none;
+    }
+    
+    /* --- Custom Table Styling --- */
+    /* This section is a stronger fix for table rendering */
+    div[data-testid="stTable"] table,
+    div[data-testid="stDataFrame"] table,
+    .stTable table,
+    .stDataFrame table {
+        background-color: #161b22 !important;
+        color: #c9d1d9 !important;
+    }
+
+    div[data-testid="stTable"] table td, 
+    div[data-testid="stTable"] table th,
+    div[data-testid="stDataFrame"] table td, 
+    div[data-testid="stDataFrame"] table th,
+    .stTable table td, .stTable table th,
+    .stDataFrame table td, .stDataFrame table th {
+        background-color: #161b22 !important;
+        color: #c9d1d9 !important;
+        border: 1px solid #30363d !important;
+    }
+
+    .stDataFrame thead th {
+        background-color: #161b22 !important;
+        color: #2ecc71 !important; /* Retain green header */
+        border-bottom: 2px solid #2ecc71 !important;
+    }
+
+    .stDataFrame tbody tr:hover {
+        background-color: #21262d !important;
+    }
+
+    /* Make sure scrollbar/scroll container also uses dark background */
+    .stDataFrame [data-testid="stTable"] {
+        background-color: #161b22 !important;
+    }
+
+    /* Also include styling for the artifacts tab tables */
+    [data-testid="stVerticalBlock"] [data-testid="stDataFrame"] thead th {
+        color: #2ecc71 !important;
+    }
+    [data-testid="stVerticalBlock"] [data-testid="stDataFrame"] tbody tr td {
+        color: #c9d1d9 !important;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
 # --- Backend and Reporting Helper Functions ---
 def html_escape(text):
@@ -67,12 +138,12 @@ def get_friendly_scan_name(plugin_name):
         "mac.netstat": "Checking macOS network statistics...",
         "mac.malfind": "Searching macOS for injected code...",
         "mac.bash": "Analyzing macOS Bash history...",
-        "windows.dlllist": "Listing loaded DLLs for Windows processes...",
+        "windows.dlllist": "Listing loaded DLLs for each process, useful for identifying injected or suspicious modules.",
         "windows.apihooks": "Detecting Windows API hooks...",
         "windows.devicetree": "Analyzing Windows device tree...",
         "windows.modscan": "Scanning Windows kernel modules...",
         "windows.consoles": "Recovers Windows console history...",
-        "windows.clipboard": "Recovers Windows clipboard contents...",
+        "windows.clipboard": "Recovers clipboard contents...",
         "windows.registry.shimcache": "Analyzing Windows Shimcache for execution artifacts...",
         "windows.registry.amcache": "Analyzing Windows Amcache for execution artifacts...",
         "windows.envars": "Listing Windows environment variables...",
@@ -87,7 +158,7 @@ def get_friendly_scan_name(plugin_name):
     }
     return mapping.get(plugin_name, f"Running scan: {plugin_name}...")
 
-def run_analysis_and_show_progress(case_name, memory_file_path, ip_enrichment_api_key, openai_api_key, progress_bar, status_text):
+def run_analysis_and_show_progress(case_name, memory_file_path, ip_enrichment_api_key, progress_bar, status_text):
     """
     Executes the backend analysis script, captures its output in real-time,
     and updates the UI with progress. Includes a timeout.
@@ -106,25 +177,22 @@ def run_analysis_and_show_progress(case_name, memory_file_path, ip_enrichment_ap
             return False
     
     # Check if detections.yaml and baseline.yaml exist at BASE_DIR
-    if not (BASE_DIR / "detections.yaml").exists():
+    if not DETECTIONS_FILE_PATH.exists():
         status_text.error(f"FATAL ERROR: '`detections.yaml`' not found at '`{html_escape(str(BASE_DIR))}`'.")
         return False
-    if not (BASE_DIR / "baseline.yaml").exists():
+    if not BASELINE_FILE_PATH.exists():
         status_text.error(f"FATAL ERROR: '`baseline.yaml`' not found at '`{html_escape(str(BASE_DIR))}`'.")
         return False
 
     cmd = [
         sys.executable, '-u', str(CLI_SCRIPT_PATH),
         "--image", str(memory_file_path), "--case", case_name,
-        "--detections", str(BASE_DIR / "detections.yaml"),
-        "--baseline", str(BASE_DIR / "baseline.yaml"),
+        "--detections", str(DETECTIONS_FILE_PATH),
+        "--baseline", str(BASELINE_FILE_PATH),
         "--outdir", str(project_output_folder),
         "--api-key", ip_enrichment_api_key
     ]
 
-    # Add OpenAI API key if provided
-    if openai_api_key:
-        cmd.extend(["--openai-api-key", openai_api_key])
 
     st.session_state.analysis_logs = []
     process = subprocess.Popen(
@@ -135,22 +203,28 @@ def run_analysis_and_show_progress(case_name, memory_file_path, ip_enrichment_ap
     TOTAL_STEPS = 20
     current_step = 0
     status_text.info("Preparing analysis environment...")
-
-    for line in iter(process.stdout.readline, ''):
-        st.session_state.analysis_logs.append(line)
-        if "[+] Running plugin:" in line:
-            current_step += 1
-            try:
-                plugin_name = line.split(":", 1)[1].strip().split(" ")[0]
-                friendly_name = get_friendly_scan_name(plugin_name)
-                status_text.info(friendly_name)
-            except IndexError:
-                pass
-            progress_fraction = min(1.0, current_step / TOTAL_STEPS)
-            progress_percent = int(progress_fraction * 100)
-            progress_bar.progress(progress_fraction, text=f"{progress_percent}% Complete")
-        if "[i] Running detection engine:" in line or "[i] Starting correlation analysis:" in line:
-            status_text.info(line.strip().replace("[i] ", ""))
+    
+    # New, more robust loop for reading process output
+    while True:
+        line = process.stdout.readline()
+        if not line and process.poll() is not None:
+            break
+        if line:
+            st.session_state.analysis_logs.append(line)
+            if "[+] Running plugin:" in line:
+                current_step += 1
+                try:
+                    plugin_name = line.split(":", 1)[1].strip().split(" ")[0]
+                    friendly_name = get_friendly_scan_name(plugin_name)
+                    status_text.info(friendly_name)
+                except IndexError:
+                # Catch cases where the line format is not as expected
+                    pass
+                progress_fraction = min(1.0, current_step / TOTAL_STEPS)
+                progress_percent = int(progress_fraction * 100)
+                progress_bar.progress(progress_fraction, text=f"{progress_percent}% Complete")
+            if "[i] Running detection engine:" in line or "[i] Starting correlation analysis:" in line:
+                status_text.info(line.strip().replace("[i] ", ""))
 
     try:
         process.wait(timeout=900)
@@ -187,24 +261,17 @@ def load_findings(project_name):
                     print(f"Warning: Could not decode line: {line}")
     return findings
 
-def load_ai_verdict(project_name):
-    """Loads the AI verdict data from a JSON file in the project-specific directory."""
-    project_output_folder = OUTPUT_FOLDER / project_name
-    ai_verdict_path = project_output_folder / "ai_verdict.json"
-    
-    if ai_verdict_path.exists():
-        with open(ai_verdict_path, 'r', encoding='utf-8') as f:
-            try:
-                return json.load(f)
-            except json.JSONDecodeError:
-                print(f"Warning: Could not decode AI verdict JSON from {ai_verdict_path}")
-    return {"verdict": "N/A", "plain_summary": "AI verdict not available.", "key_findings": [], "attack_chain": [], "malware_match": "None apparent", "confidence": "N/A", "anomalies": {"flags": [], "corrections": []}, "glossary": {}, "approx_ordering": True}
-
 def load_detections_config():
     """Loads the detections.yaml config from the base directory."""
-    detections_path = BASE_DIR / "detections.yaml"
-    if detections_path.exists():
-        with open(detections_path, 'r', encoding='utf-8') as f:
+    if DETECTIONS_FILE_PATH.exists():
+        with open(DETECTIONS_FILE_PATH, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
+    return None
+
+def load_baseline_config():
+    """Loads the baseline.yaml config from the base directory."""
+    if BASELINE_FILE_PATH.exists():
+        with open(BASELINE_FILE_PATH, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
     return None
 
@@ -266,15 +333,14 @@ def get_user_friendly_correlated_title(finding_id):
     }
     return mapping.get(finding_id, finding_id.replace('_', ' ').title())
 
-
 def render_correlated_finding_narrative(finding, detections_config):
     """
     Renders a correlated finding as a narrative flow for the 'Attack Story' section.
     """
-    html_content_title = f"<h4><span style='text-decoration: none; color: inherit;'>{html_escape(finding.get('title', 'Correlated Threat'))}</span></h4>"
+    html_content_title = f"<h4 style='color: #2ecc71;'><span style='text-decoration: none; color: inherit;'>{html_escape(finding.get('title', 'Correlated Threat'))}</span></h4>"
     html(html_content_title, height=45)
 
-    st.markdown(f"<p style='font-size: 1.1rem; color: #566573; text-decoration: none;'>{html_escape(get_narrative(finding.get('id'), detections_config))}</p>", unsafe_allow_html=True)
+    st.markdown(f"<p style='font-size: 1.1rem; color: #c9d1d9; text-decoration: none;'>{html_escape(get_narrative(finding.get('id'), detections_config))}</p>", unsafe_allow_html=True)
 
     evidence_list = finding.get('evidence', [])
     if not evidence_list:
@@ -283,7 +349,7 @@ def render_correlated_finding_narrative(finding, detections_config):
 
     for item in evidence_list:
         pid = item.get('correlated_pid')
-        html_content_pid = f"<h5><span style='text-decoration: none; color: inherit;'>Involved Process ID (PID): `{html_escape(str(pid))}`</span></h5>"
+        html_content_pid = f"<h5 style='color: #2ecc71;'><span style='text-decoration: none; color: inherit;'>Involved Process ID (PID): `{html_escape(str(pid))}`</span></h5>"
         html(html_content_pid, height=35)
         findings_details = item.get('correlated_findings', [])
 
@@ -364,6 +430,33 @@ def render_correlated_finding_narrative(finding, detections_config):
         st.markdown(path_html, unsafe_allow_html=True)
         st.markdown("---")
 
+def render_evidence_as_list(evidence_list, finding_id):
+    """
+    Renders evidence items as a detailed list, useful for findings with simple key-value pairs.
+    """
+    if not evidence_list:
+        st.info("No detailed evidence provided for this finding.")
+        return
+
+    st.markdown("<ul style='list-style-type: none; padding-left: 0;'>", unsafe_allow_html=True)
+    for item in evidence_list[:10]: # Limit to top 10 items for readability
+        item_details = ""
+        if finding_id == 'kernel_callbacks_suspicious':
+            item_details = f"Callback: `{html_escape(item.get('Details', 'N/A'))}`, Owner: `{html_escape(item.get('OwnerModule', 'N/A'))}`"
+        elif finding_id == 'modules_hidden_vs_modscan':
+            item_details = f"Module: `{html_escape(item.get('Module', 'N/A'))}`, Base Address: `{html_escape(item.get('Base', 'N/A'))}`"
+        elif finding_id == 'registry_orphan_hives':
+            item_details = f"Orphaned Hive: `{html_escape(item.get('HivePath', 'N/A'))}`"
+        elif finding_id == 'dumpit_present':
+            item_details = f"Tool Path: `{html_escape(item.get('Path', 'N/A'))}`"
+        
+        st.markdown(f"<li>{item_details}</li>", unsafe_allow_html=True)
+    
+    if len(evidence_list) > 10:
+        st.markdown(f"<li>...and {len(evidence_list) - 10} more. See raw artifacts for full details.</li>", unsafe_allow_html=True)
+    st.markdown("</ul>", unsafe_allow_html=True)
+
+
 def render_evidence_as_table(evidence_list, finding_id):
     if not evidence_list:
         st.info("No detailed evidence provided for this finding.")
@@ -399,6 +492,7 @@ def render_evidence_as_table(evidence_list, finding_id):
 
     COLUMN_CONFIG = {
         "psxview_hidden": { "columns": ["pid", "name", "pslist", "psscan"], "rename": {"pid": "PID", "name": "Process Name", "pslist": "Visible in Process List", "psscan": "Found by DeepProbe Scan"}},
+        "unknown_process_name": { "columns": ["pid", "name", "path"], "rename": {"pid": "PID", "name": "Process Name", "path": "Path"}},
         "suspicious_cmdline_args": { "columns": ["pid", "name", "command_line"], "rename": {"pid": "PID", "name": "Process", "command_line": "Suspicious Command Line"}},
         "suspicious_connection": { "columns": ["owner", "LocalAddr", "LocalPort", "ForeignAddr", "ForeignPort"], "rename": {"owner": "Process", "LocalAddr": "Local Address", "LocalPort": "Local Port", "ForeignAddr": "Remote Address", "ForeignPort": "Remote Port"}},
         "suspicious_network_enrichment": { "columns": ["pid", "owner", "ip", "country", "isp", "reputation", "notes"], "rename": {"pid": "PID", "owner": "Process Owner", "ip": "Remote IP", "country": "Country", "isp": "ISP", "reputation": "Reputation", "notes": "Reason"}},
@@ -408,7 +502,7 @@ def render_evidence_as_table(evidence_list, finding_id):
         "userassist_suspicious": { "columns": ["Path", "Count", "LastUpdated"], "rename": {"Path": "Program Path", "Count": "Execution Count", "LastUpdated": "Last Executed"}},
         "registry_run_key_persistence": { "columns": ["Key", "Name", "Decoded"], "rename": {"Key": "Registry Key", "Name": "Entry", "Decoded": "Command Executed"}},
         "exec_from_tmp": {"columns": ["pid", "name", "path"], "rename": {"pid": "PID", "name": "Process Name", "path": "Execution Path"}},
-        "bash_history_suspicious": {"columns": ["User", "Command"], "rename": {"User": "User", "Command": "Command Executed"}},
+        "bash_history_suspicious": { "columns": ["User", "Command"], "rename": {"User": "User", "Command": "Command Executed"}},
         "correlation_findings": {
             "columns": ["correlated_pid", "correlated_findings", "correlated_rule_ids"],
             "rename": {
@@ -417,6 +511,10 @@ def render_evidence_as_table(evidence_list, finding_id):
                 "correlated_rule_ids": "Triggered Rule IDs"
             }
         },
+        "dumpit_present": { "columns": ["Path"], "rename": {"Path": "Memory Acquisition Tool Path"}},
+        "kernel_callbacks_suspicious": { "columns": ["Details", "OwnerModule"], "rename": {"Details": "Callback Details", "OwnerModule": "Owner Module"}},
+        "modules_hidden_vs_modscan": { "columns": ["Module", "Base", "Notes"], "rename": {"Module": "Module Name", "Base": "Base Address", "Notes": "Notes"}},
+        "registry_orphan_hives": { "columns": ["HivePath", "Notes"], "rename": {"HivePath": "Orphaned Hive Path", "Notes": "Notes"}},
     }
 
     config = COLUMN_CONFIG.get(finding_id)
@@ -463,7 +561,6 @@ def render_evidence_as_table(evidence_list, finding_id):
 artifact_descriptions = {
     "report.html": {"title": "Full Analysis Report (HTML)", "description": "The complete HTML analysis report generated by DeepProbe."},
     "findings.jsonl": {"title": "Detected Findings (JSONL Data)", "description": "Raw JSON Lines format of all detected forensic findings."},
-    "ai_verdict.json": {"title": "AI Verdict (JSON Data)", "description": "The AI-generated verdict and summary of the memory forensic analysis."},
     "console_output.log": {"title": "CLI Console Output Log", "description": "Comprehensive log of the analysis process and console output."},
     "memory_dump.raw": {"title": "Raw Memory Dump File", "description": "The raw memory image file (if a copy was made)."},
     "dump_files.zip": {"title": "Dumped Files (ZIP Archive)", "description": "Archive containing dumped processes or extracted files from memory."},
@@ -497,7 +594,7 @@ artifact_descriptions = {
     "windows_registry_printkey_Software_Microsoft_Windows_CurrentVersion_Policies_Explorer_Run.txt": {"title": "Registry: Policies Explorer Run Auto-Start", "description": "Auto-run entries from the Windows Registry Policies Explorer Run key."},
     "windows_registry_printkey_Software_Microsoft_Windows_CurrentVersion_RunServices.txt": {"title": "Registry: RunServices Key", "description": "Programs configured to run as services via the 'RunServices' registry key."},
     "windows_registry_printkey_Software_WOW6432Node_Microsoft_Windows_CurrentVersion_Run.txt": {"title": "Registry: Run Key (WOW6432Node)", "description": "Auto-start entries for 32-bit applications on 64-bit Windows systems."},
-    "windows_registry_printkey_Software_WOW6432Node_Microsoft_Windows_CurrentVersion_RunOnce.txt": {"title": "Registry: RunOnce Key (WOW6432Node)", "description": "Run-once entries for 32-bit applications on 64-bit Windows systems."},
+    "windows_registry_printkey_Software_WOW6432Node_Microsoft_Windows_CurrentVersion_RunOnce.txt": {"title": "Registry: Run-once entries for 32-bit applications on 64-bit Windows systems."},
     "windows_registry_printkey_Software_Microsoft_Windows_NT_CurrentVersion_Windows_AppInit_DLLs.txt": {"title": "Registry: AppInit DLLs", "description": "DLLs configured to load into every user-mode application on Windows, a common persistence mechanism."},
     "windows_registry_printkey_System_CurrentControlSet_Services.txt": {"title": "Registry: Services Configuration", "description": "Raw configuration details for all Windows services found in the registry."},
     "windows_registry_userassist.txt": {"title": "Registry: UserAssist (GUI Program History)", "description": "Records recently executed GUI applications on Windows, providing user activity history and launch counts."},
@@ -547,402 +644,401 @@ artifact_descriptions = {
 def main():
     print("[DEBUG] DeepProbe UI: main() function started.")
 
-    st.set_page_config(page_title="DeepProbe | Memory Forensics", page_icon="🕵️", layout="wide", initial_sidebar_state="expanded") # Changed emoji
+    st.set_page_config(page_title="DeepProbe | Memory Forensics", page_icon="🕵️", layout="wide", initial_sidebar_state="expanded")
 
     if 'analysis_successful' not in st.session_state: st.session_state.analysis_successful = False
     if 'active_page' not in st.session_state: st.session_state.active_page = "Home"
     if 'project_name' not in st.session_state: st.session_state.project_name = ""
     if 'ip_enrichment_api_key' not in st.session_state: st.session_state.ip_enrichment_api_key = ""
-    if 'openai_api_key' not in st.session_state: st.session_state.openai_api_key = ""
 
-    try:
-        st.markdown("""<style>
-                @import url('https://fonts.googleapis.com/css2?family=Roboto:wght@300;400;700&display=swap');
-                .block-container { padding-top: 2rem !important; }
-                html, body, .stApp { font-family: 'Roboto', sans-serif; background-color: #f0f2f6; color: #333; }
-                .header { background-color: #2c3e50; padding: 2rem 2rem 1.5rem 2rem; border-bottom: 1px solid #dcdcdc; display: flex; align-items: center; gap: 1rem; margin: -2rem -1rem 1rem -1rem; }
-                .header h1 { font-size: 2.5rem; font-weight: 700; color: #ffffff; margin: 0; }
-                .header span { font-size: 1rem; font-weight: 300; color: #bdc3c7; padding-top: 10px; }
+    # Custom dark theme and hacker vibe CSS
+    st.markdown("""
+        <style>
+        @import url('https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;700&display=swap');
+        
+        /* --- General Dark Theme & Hacker Vibe --- */
+        html, body, [data-testid="stAppViewContainer"] {
+            background-color: #0d1117;
+            color: #c9d1d9;
+            font-family: 'Fira Code', monospace;
+        }
+        
+        /* This is the key change to remove the top whitespace */
+        [data-testid="stAppViewContainer"] > .main {
+            padding-top: 0rem;
+        }
+        
+        /* --- Main UI Containers & Headers --- */
+        .header {
+            background-color: #161b22;
+            padding: 2rem 2rem 1.5rem 2rem;
+            border-bottom: 1px solid #30363d;
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            margin-top: 0rem;
+            margin-left: -1rem;
+            margin-right: -1rem;
+            margin-bottom: 1rem;
+        }
+        .header h1 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            color: #2ecc71;
+            margin: 0;
+            text-shadow: 1px 1px 2px rgba(46, 204, 113, 0.4);
+        }
+        .header span {
+            font-size: 1rem;
+            font-weight: 400;
+            color: #8b949e;
+            padding-top: 10px;
+        }
+        h1, h2, h3, h4, h5, h6 {
+            color: #2ecc71;
+            font-weight: 700;
+            margin-top: 1.5rem;
+            margin-bottom: 0.5rem;
+        }
+        
+        /* --- Sidebar & Footer --- */
+        [data-testid="stSidebar"] {
+            background-color: #161b22;
+            border-right: 1px solid #30363d;
+        }
+        [data-testid="stSidebar"] h2 {
+            color: #2ecc71;
+            border-bottom: 2px solid #30363d;
+            padding-bottom: 5px;
+        }
+        .sidebar-footer {
+            margin-top: auto;
+            padding-bottom: 1rem;
+        }
+        
+        /* --- Form Inputs and Buttons --- */
+        .stTextInput label, .stSelectbox label, .stMarkdown, .stInfo, .stText, p, li, .stTextarea label, .st-bf, .st-bp, .st-bb, .st-bh, .st-bi {
+            color: #c9d1d9 !important;
+        }
+        .stTextInput input, .stSelectbox div[data-baseweb="select"] > div, .stTextArea textarea {
+            background-color: #0d1117 !important;
+            border: 1px solid #30363d !important;
+            border-radius: 8px !important;
+            color: #c9d1d9 !important;
+        }
+        .stTextInput input:focus, .stSelectbox div[data-baseweb="select"] > div:focus-within {
+            border-color: #2ecc71 !important;
+            box-shadow: 0 0 0 3px rgba(46, 204, 113, 0.25) !important;
+        }
+        
+        .stButton > button {
+            background-color: #21262d;
+            color: #2ecc71;
+            font-weight: bold;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+        }
+        .stButton > button:hover {
+            background-color: #30363d;
+            border-color: #2ecc71;
+            color: #2ecc71;
+        }
 
-                [data-testid="stSidebar"] {
-                    background-image: linear-gradient(to bottom, #eaf2f8, #fdfefe);
-                    border-right: 1px solid #d4e6f1;
-                }
-                [data-testid="stSidebar"] > div:first-child {
-                    display: flex;
-                    flex-direction: column;
-                    height: 100%;
-                }
-                .sidebar-footer {
-                    margin-top: auto;
-                    padding-bottom: 1rem;
-                }
-                [data-testid="stSidebar"] h2 {
-                    color: #2874a6;
-                    border-bottom: 2px solid #a9cce3;
-                    padding-bottom: 5px;
-                }
-                [data-testid="stSidebar"] .stButton > button {
-                    background-color: #3498db; color: white; font-weight: bold;
-                    width: 100%; padding: 0.75rem 0; border-radius: 8px; border: none;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                }
-                [data-testid="stSidebar"] .stButton > button:hover {
-                    background-color: #2980b9;
-                    box-shadow: 0 4pX 8px rgba(0,0,0,0.15);
-                }
-                [data-testid="stSidebar"] .stMarkdown, 
-                [data-testid="stSidebar"] .stInfo,
-                [data-testid="stSidebar"] .stText,
-                [data-testid="stSidebar"] p,
-                [data-testid="stSidebar"] li {
-                    color: #566573 !important;
-                }
-                /* Specific background for the st.info box in sidebar */
-                [data-testid="stSidebar"] .stInfo { 
-                    background-color: #e8f6f8; /* Lighter background for info box */
-                    color: #2e86c1 !important; /* Dark blue text for info box */
-                    padding: 0.75rem;
-                    border-radius: 6px;
-                    margin-bottom: 1rem;
-                }
+        /* The rule below is the fix for the button text color */
+        div.stButton > button:first-child span {
+            color: #000000 !important;
+            font-weight: bold;
+        }
 
-                .stTextInput label {
-                    color: #333 !important;
-                }
-                .stTextInput input {
-                    background-color: #ffffff !important;
-                    border: 1px solid #bdc3c7 !important;
-                    border-radius: 8px !important;
-                    padding: 10px !important;
-                    box-shadow: 0 1px 3px rgba(0,0,0,0.05) inset;
-                    transition: border-color 0.2s, box-shadow 0.2s;
-                    color: #333 !important;
-                }
-                .stTextInput input:focus {
-                    border-color: #3498db !important;
-                    box-shadow: 0 0 0 3px rgba(52, 152, 219, 0.25) !important;
-                }
+        /* Also apply the same color to the button when hovered */
+        div.stButton > button:first-child:hover span {
+            color: #000000 !important;
+        }
 
-                /* Styling for selectbox */
-                .stSelectbox label {
-                    color: #333 !important;
-                }
-                .stSelectbox div[data-baseweb="select"] > div {
-                    background-color: #ffffff !important;
-                    border: 1px solid #dcdcdc !important;
-                    color: #333 !important;
-                    border-radius: 8px;
-                }
-                .stSelectbox div[data-baseweb="select"] > div:hover {
-                    border-color: #3498db !important;
-                }
-                .stSelectbox div[data-baseweb="select"] > div > div {
-                     color: #333 !important;
-                }
-                /* Option list in selectbox */
-                div[role="listbox"] {
-                    background-color: #ffffff !important;
-                    border: 1px solid #dcdcdc !important;
-                }
-                div[role="option"] {
-                    color: #333 !important;
-                }
-                div[role="option"]:hover {
-                    background-color: #eaf2f8 !important;
-                }
+        /* The following rule is to ensure the button itself is black */
+        div.stButton > button:first-child {
+            background-color: #000000;
+        }
+        
+        /* Tooltip text color */
+        .st-emotion-cache-12t9k8e {
+            color: #c9d1d9 !important;
+        }
+        
+        /* --- Analysis Widgets and Severity Boxes --- */
+        .scan-widget, .card, .artifact-card, .verdict-box, .narrative-block, .findings-narrative-item {
+            background-color: #161b22;
+            border-color: #30363d;
+            color: #c9d1d9;
+        }
+        .scan-widget-grid { display: flex; flex-wrap: wrap; gap: 1rem; }
+        .scan-widget {
+             cursor: default;
+             text-align: center;
+             transition: all 0.2s ease-in-out;
+             padding: 1.5rem 1rem;
+             border-radius: 8px;
+             box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+             min-width: 200px;
+             flex: 1;
+        }
+        .scan-widget:hover {
+            transform: translateY(-5px);
+            border-color: #2ecc71;
+            box-shadow: 0 4px 12px rgba(46, 204, 113, 0.4);
+        }
+        .scan-widget .title {
+            font-weight: bold;
+            color: #2ecc71;
+            text-shadow: 0 0 5px rgba(46, 204, 113, 0.2);
+        }
+        
+        .card.critical { border-left: 8px solid #f85149 !important; }
+        .card.high { border-left: 8px solid #ff7b72 !important; }
+        .card.medium { border-left: 8px solid #e3b341 !important; }
+        .card.low { border-left: 8px solid #2ecc71 !important; }
+        .card.informational { border-left: 8px solid #8b949e !important; }
+        
+        .verdict-box {
+            background-color: #161b22;
+            border-left: 8px solid #2ecc71 !important;
+            padding: 1.5rem;
+            border-radius: 8px;
+            margin-bottom: 1rem;
+        }
+        .verdict-box.critical { border-color: #f85149 !important; }
+        .verdict-box.high { border-color: #e67e22 !important; }
+        .verdict-box.medium { border-color: #e3b341 !important; }
+        .verdict-box.low { border-color: #2ecc71 !important; }
+        .verdict-box.informational { border-color: #8b949e !important; }
 
+        .verdict-box h2, .verdict-box p { color: inherit !important; }
 
-                .scan-widget-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; }
-                .scan-widget {
-                    background-color: #ffffff;
-                    border: 1px solid #dcdcdc;
-                    border-radius: 8px;
-                    padding: 1.5rem 1rem;
-                    text-align: center;
-                    transition: all 0.2s ease-in-out;
-                    cursor: default;
-                    color: #333; /* Default text color for scan widgets */
-                }
-                .scan-widget:hover { transform: translateY(-5px); border-color: #3498db; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
-                .scan-widget:nth-of-type(1) { background-color: #d1ecf1; color: #0c5460; } /* Light teal */
-                .scan-widget:nth-of-type(2) { background-color: #d4edda; color: #155724; } /* Light green */
-                .scan-widget:nth-of-type(3) { background-color: #f8d7da; color: #721c24; } /* Light red */
-                .scan-widget:nth-of-type(4) { background-color: #e2e6ea; color: #383d41; } /* Light gray */
-                .scan-widget:nth-of-type(5) { background-color: #ffeeba; color: #856404; } /* Light yellow */
-                .scan-widget:nth-of-type(6) { background-color: #cce5ff; color: #004085; } /* Light blue */
-                .scan-widget:nth-of-type(7) { background-color: #f0e68c; color: #695d01; } /* Khaki */
-                .scan-widget:nth-of-type(8) { background-color: #e0b0ff; color: #5a008c; } /* Light purple */
+        /* --- Custom Element Styling --- */
+        .attack-path-container { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 10px; margin-top: 15px; justify-content: center; }
+        .attack-step { background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1rem; width: 280px; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.05); min-height: 120px; display: flex; flex-direction: column; justify-content: center; align-items: center; color: #c9d1d9;}
+        .attack-step hr { margin: 0.5rem 0; border-top: 1px solid #30363d; width: 80%; }
+        .attack-step p { font-size: 0.9rem; color: #c9d1d9; margin: 0; }
+        .attack-arrow { font-size: 2rem; color: #2ecc71; font-weight: bold; display: flex; align-items: center; justify-content: center; padding: 0 10px; }
+        .narrative-block {
+            background-color: #21262d;
+            border-left: 4px solid #2ecc71;
+            padding: 10px 15px;
+            margin-top: 10px;
+            border-radius: 4px;
+        }
+        .narrative-block p {
+            color: #c9d1d9;
+            margin: 0;
+        }
 
-                .severity-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; margin-bottom: 2rem; }
-                .severity-box { color: white; padding: 1rem; border-radius: 8px; text-align: center; }
-                .severity-title { font-size: 1.2rem; font-weight: bold; } .severity-count { font-size: 2.5rem; font-weight: bold; }
-                .severity-box.critical { background-color: #c0392b; } .severity-box.high { background-color: #e67e22; } .severity-box.medium { background-color: #f1c40f; color: #333; } .severity-box.low { background-color: #5dade2; }
-                .severity-box.informational { background-color: #2ecc71; }
+        .findings-narrative-list {
+            padding-left: 0;
+            list-style: none;
+        }
+        .findings-narrative-item {
+            background-color: #21262d;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 10px 15px;
+            margin-bottom: 8px;
+            display: flex;
+            align-items: flex-start;
+            gap: 10px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            border-left-width: 8px;
+        }
+        .findings-narrative-item.critical { border-left-color: #f85149; }
+        .findings-narrative-item.high { border-left-color: #ff7b72; }
+        .findings-narrative-item.medium { border-left-color: #e3b341; }
+        .findings-narrative-item.low { border-left-color: #2ecc71; }
+        .findings-narrative-item.informational { border-left-color: #8b949e; }
+        
+        .findings-narrative-item strong {
+            flex-shrink: 0;
+            color: #2ecc71;
+            font-size: 0.95rem;
+            width: 200px;
+        }
+        .findings-narrative-item span {
+            flex-grow: 1;
+            color: #c9d1d9;
+            font-size: 0.9rem;
+        }
 
-                h1, h2, h3, h4, h5, h6 { 
-                    color: #2c3e50; /* Ensures all headings are dark */
-                    font-weight: 700; /* Makes all headings bold */
-                    margin-top: 1.5rem; /* Add spacing above headings for better visual separation */
-                    margin-bottom: 0.5rem;
-                }
-                /* Specific adjustment for h1 to ensure it doesn't get too much top margin if it's the very first element */
-                .block-container h1:first-of-type {
-                    margin-top: 0rem;
-                }
+        .stTabs [data-testid="stTabRecButton"] {
+            font-size: 1.35rem;
+            font-weight: 700;
+            background-color: #21262d;
+            color: #c9d1d9;
+            border: 2px solid #30363d;
+            border-bottom: none;
+            border-radius: 10px 10px 0 0;
+        }
+        .stTabs [data-testid="stTabRecButton"]:hover {
+            background-color: #30363d;
+            color: #2ecc71;
+        }
+        .stTabs [data-testid="stTabRecButton"][aria-selected="true"] {
+            background-color: #2ecc71;
+            color: #161b22;
+            border: 2px solid #2ecc71;
+            border-bottom: none;
+        }
+        .artifact-card {
+            background-color: #21262d;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 1rem;
+            margin-bottom: 1rem;
+            box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1);
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            height: 100%;
+            min-height: 200px;
+        }
+        .artifact-card h3 {
+            margin-top: 0;
+            font-size: 1.1rem;
+            color: #2ecc71;
+        }
+        .artifact-card p {
+            font-size: 0.85rem;
+            color: #c9d1d9;
+            flex-grow: 1;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        .artifact-card .stDownloadButton button {
+            margin-top: 10px;
+            width: 100%;
+            background-color: #2ecc71;
+            color: #161b22;
+            font-weight: bold;
+            border-radius: 8px;
+            border: none;
+            padding: 0.5rem 0;
+            transition: background-color 0.2s;
+            cursor: pointer;
+        }
+        .artifact-card .stDownloadButton button:hover {
+            background-color: #21ba64;
+        }
+        /* Styling for missing artifact files */
+        .artifact-card.missing-file {
+            background-color: #2d191c;
+            border-color: #30363d;
+        }
+        .artifact-card.missing-file h3 {
+            color: #f85149;
+        }
+        .artifact-card.missing-file p {
+            color: #c9d1d9;
+        }
+        .artifact-card.missing-file .stDownloadButton button {
+            background-color: #30363d;
+            color: #8b949e;
+            cursor: not-allowed;
+        }
+        .artifact-card.missing-file .stDownloadButton button:hover {
+            background-color: #30363d;
+        }
 
-                /* Ensure paragraph and list item text in the main content area is dark */
-                .st-emotion-cache-1g8o8z p, /* Target specific Streamlit paragraph class if needed */
-                .st-emotion-cache-1g8o8z li, /* Target specific Streamlit list item class if needed */
-                .block-container p,
-                .block-container li {
-                    color: #333 !important;
-                }
-                
-                /* Styling for the main content area form button */
-                [data-testid="stForm"] .stButton > button {
-                    background-color: #3498db; /* Blue primary color */
-                    color: white; /* White text */
-                    font-weight: bold;
-                    width: 100%;
-                    padding: 0.75rem 0;
-                    border-radius: 8px;
-                    border: none;
-                    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-                    transition: background-color 0.2s ease-in-out, box-shadow 0.2s ease-in-out;
-                }
-                [data-testid="stForm"] .stButton > button:hover {
-                    background-color: #2980b9; /* Darker blue on hover */
-                    box-shadow: 0 4px 8px rgba(0,0,0,0.15);
-                }
+        .severity-grid {
+            display: flex;
+            justify-content: space-between;
+            gap: 1rem;
+            margin-bottom: 1rem;
+        }
 
-
-                .attack-path-container { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 10px; margin-top: 15px; justify-content: center; }
-                .attack-step { background-color: #eaf2f8; border: 1px solid #d4e6f1; border-radius: 8px; padding: 1rem; width: 280px; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.05); min-height: 120px; display: flex; flex-direction: column; justify-content: center; align-items: center; color: #333;}
-                .attack-step hr { margin: 0.5rem 0; border-top: 1px solid #aed6f1; width: 80%; }
-                .attack-step p { font-size: 0.9rem; color: #555; margin: 0; }
-                .attack-arrow { font-size: 2rem; color: #5dade2; font-weight: bold; display: flex; align-items: center; justify-content: center; padding: 0 10px; }
-
-                .verdict-box {
-                    padding: 1.5rem;
-                    border-radius: 12px;
-                    margin-bottom: 2rem;
-                    text-align: center;
-                    box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-                }
-                /* AI Verdict Box */
-                .verdict-box.ai-verdict { background-color: #34495e; color: white; }
-                .verdict-box.ai-verdict h2, .verdict-box.ai-verdict p, .verdict-box.ai-verdict li, .verdict-box.ai-verdict small { color: white !important; }
-                
-                /* Rule-Based Verdict Boxes - using existing severity colors */
-                .verdict-box.critical { background-color: #c0392b; color: white; }
-                .verdict-box.high { background-color: #e67e22; color: white; }
-                .verdict-box.medium { background-color: #f1c40f; color: #333; } /* Dark text for medium for contrast */
-                .verdict-box.low { background-color: #5dade2; color: white; }
-                .verdict-box.informational { background-color: #2ecc71; color: white; }
-
-                .verdict-box h2 {
-                    color: inherit;
-                    font-size: 2.2rem;
-                    margin-bottom: 0.5rem;
-                }
-                .verdict-box p {
-                    font-size: 1.1rem;
-                    opacity: 0.9;
-                }
-
-                .card { background-color: #ffffff; border: 1px solid #dcdcdc; border-radius: 12px; box-shadow: 0 0 0 1px #a9cce3 inset; margin-bottom: 16px; color: #333; }
-                .card.critical { border-left: 8px solid #c0392b !important; }
-                .card.high { border-left: 8px solid #e67e22 !important; }
-                .card.medium { border-left: 8px solid #f1c40f !important; }
-                .card.low { border-left: 8px solid #5dade2 !important; }
-                .card.informational { border-left: 8px solid #2ecc71 !important; }
-
-
-                .narrative-block {
-                    background-color: #f8f9fa;
-                    border-left: 4px solid #3498db;
-                    padding: 10px 15px;
-                    margin-top: 10px;
-                    border-radius: 4px;
-                }
-                .narrative-block p {
-                    color: #333;
-                    margin: 0;
-                }
-
-                .findings-narrative-list {
-                    padding-left: 0;
-                    list-style: none;
-                }
-                .findings-narrative-item {
-                    background-color: #ffffff;
-                    border: 1px solid #e0e0e0;
-                    border-radius: 6px;
-                    padding: 10px 15px;
-                    margin-bottom: 8px;
-                    display: flex;
-                    align-items: flex-start;
-                    gap: 10px;
-                    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
-                    border-left-width: 8px;
-                }
-                .findings-narrative-item.critical { border-left-color: #c0392b; }
-                .findings-narrative-item.high { border-left-color: #e67e22; }
-                .findings-narrative-item.medium { border-left-color: #f1c40f; }
-                .findings-narrative-item.low { border-left-color: #5dade2; }
-                .findings-narrative-item.informational { border-left-color: #2ecc71; }
-
-                .findings-narrative-item strong {
-                    flex-shrink: 0;
-                    color: #2c3e50;
-                    font-size: 0.95rem;
-                    width: 200px;
-                }
-                .findings-narrative-item span {
-                    flex-grow: 1;
-                    color: #555;
-                    font-size: 0.9rem;
-                }
-
-                .artifact-card {
-                    background-color: #ffffff; /* Light background for card */
-                    border: 1px solid #dcdcdc;
-                    border-radius: 8px;
-                    padding: 1rem;
-                    margin-bottom: 1rem;
-                    box-shadow: 0 2px 5px rgba(0, 0, 0, 0.1); /* Lighter shadow */
-                    display: flex;
-                    flex-direction: column;
-                    justify-content: space-between;
-                    height: 100%;
-                    min-height: 200px;
-                }
-                .artifact-card h3 {
-                    margin-top: 0;
-                    font-size: 1.1rem;
-                    color: #2874a6; /* Darker blue for title */
-                }
-                .artifact-card p {
-                    font-size: 0.85rem;
-                    color: #566573; /* Darker grey for description */
-                    flex-grow: 1;
-                    overflow: hidden;
-                    text-overflow: ellipsis;
-                }
-                .artifact-card .stDownloadButton button {
-                    margin-top: 10px;
-                    width: 100%;
-                    background-color: #3498db; /* Blue download button */
-                    color: white;
-                    font-weight: bold;
-                    border-radius: 8px;
-                    border: none;
-                    padding: 0.5rem 0;
-                    transition: background-color 0.2s;
-                    cursor: pointer;
-                }
-                .artifact-card .stDownloadButton button:hover {
-                    background-color: #2980b9; /* Darker blue on hover */
-                }
-                /* Styling for missing artifact files */
-                .artifact-card.missing-file {
-                    background-color: #fdf2f2; /* Light red background */
-                    border-color: #f5c6cb;
-                }
-                .artifact-card.missing-file h3 {
-                    color: #dc3545; /* Dark red title */
-                }
-                .artifact-card.missing-file p {
-                    color: #833a41; /* Darker red description */
-                }
-                .artifact-card.missing-file .stDownloadButton button {
-                    background-color: #ced4da; /* Greyed out button */
-                    color: #6c757d;
-                    cursor: not-allowed;
-                }
-                .artifact-card.missing-file .stDownloadButton button:hover {
-                    background-color: #ced4da;
-                }
-
-                .stTabs [data-testid="stTabRecButton"] {
-                    font-size: 1.35rem;
-                    font-weight: 700;
-                    color: #2c3e50; /* Dark text for tabs */
-                    background-color: #ecf0f1;
-                    border: 2px solid #bdc3c7;
-                    border-bottom: none;
-                    border-radius: 10px 10px 0 0;
-                    padding: 1rem 2rem;
-                    margin-right: 10px;
-                    transition: all 0.2s ease-in-out;
-                    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-                }
-                .stTabs [data-testid="stTabRecButton"]:hover {
-                    background-color: #dfe6e9;
-                    color: #3498db;
-                }
-                .stTabs [data-testid="stTabRecButton"][aria-selected="true"] {
-                    background-color: #3498db; /* Active tab in blue */
-                    color: white;
-                    border: 2px solid #3498db;
-                    border-bottom: none;
-                    margin-bottom: -2px;
-                    padding-bottom: calc(1rem + 2px);
-                    box-shadow: 0 6px 12px rgba(52, 152, 219, 0.4);
-                }
-                .progress-container {
-                    margin-top: 2rem;
-                    padding: 1rem;
-                    border: 1px solid #dcdcdc;
-                    border-radius: 8px;
-                    background-color: #ffffff;
-                    box-shadow: 0 2px 5px rgba(0,0,0,0.05);
-                    width: 50%;
-                    margin-left: auto;
-                    margin-right: auto;
-                    color: #333; /* Ensure text is dark */
-                }
-                /* Ensure all default Streamlit text is dark in light mode */
-                .st-cq, .st-ci, .st-ea, .st-eq, .st-es, .st-eu, .st-ew, .st-ex, .st-b5, .st-b6, .st-b7, .st-b8, .st-b9, .st-ba, .st-bb,
-                .stBlock > div > div > p, .stBlock > div > div > ul > li,
-                .stMarkdown, .stText,
-                .stDataFrame /* For dataframes to have dark text */
-                 {
-                    color: #333 !important;
-                }
-                .stTextArea textarea {
-                    color: #333 !important;
-                    background-color: #ffffff !important;
-                    border: 1px solid #dcdcdc !important;
-                }
-                /* Adjust for Streamlit's internal element targeting for code blocks */
-                .stCode, [data-testid="stCodeBlock"] code {
-                    background-color: #f8f9fa !important;
-                    color: #333 !important;
-                    border: 1px solid #e0e0e0 !important;
-                }
-
-            </style>""", unsafe_allow_html=True)
-    except Exception as e:
-        st.error(f"Error loading UI styles. This might be a Streamlit rendering issue. Error: {e}")
-        st.stop()
+        .severity-box {
+            flex: 1;
+            text-align: center;
+            border-radius: 8px;
+            padding: 1rem;
+            color: white;
+            min-width: 120px;
+        }
+        
+        .severity-box.critical { background-color: #f85149; }
+        .severity-box.high { background-color: #ff7b72; } 
+        .severity-box.medium { background-color: #e3b341; color: #333; } 
+        .severity-box.low { background-color: #2ecc71; }
+        .severity-box.informational { background-color: #8b949e; }
+        
+        .severity-title {
+            font-size: 1.25rem;
+            font-weight: 700;
+            margin-bottom: 0.25rem;
+        }
+        
+        .severity-count {
+            font-size: 2.5rem;
+            font-weight: 700;
+        }
+        
+        /* Table styling for dark theme */
+        [data-testid="stDataFrame"] {
+            background-color: #161b22;
+            color: #c9d1d9;
+            border: 1px solid #30363d;
+        }
+        [data-testid="stDataFrame"] table {
+            background-color: #161b22;
+            color: #c9d1d9;
+        }
+        [data-testid="stDataFrame"] thead th {
+            background-color: #161b22 !important;
+            color: #2ecc71;
+            border-bottom: 2px solid #2ecc71;
+        }
+        [data-testid="stDataFrame"] tbody tr {
+            background-color: #161b22;
+            color: #c9d1d9;
+        }
+        [data-testid="stDataFrame"] tbody tr td {
+            background-color: #161b22;
+            color: #c9d1d9;
+        }
+        [data-testid="stDataFrame"] tbody tr:hover {
+            background-color: #21262d;
+        }
+        
+        /* Specific styling for artifact tables in Artifacts tab */
+        [data-testid="stVerticalBlock"] [data-testid="stDataFrame"] thead th {
+            color: #2ecc71;
+        }
+        [data-testid="stVerticalBlock"] [data-testid="stDataFrame"] tbody tr td {
+            color: #c9d1d9;
+        }
+        </style>
+        """, unsafe_allow_html=True)
 
 
     st.markdown('<div class="header"><h1>DeepProbe</h1><span>Memory Forensics Framework</span></div>', unsafe_allow_html=True)
 
     with st.sidebar:
-        html_sidebar_about_title = "<h2><span style='text-decoration: none; color: inherit;'>About DeepProbe</span></h2>"
-        html(html_sidebar_about_title, height=45)
+        st.markdown("<h2 style='color: #2ecc71;'>About DeepProbe</h2>", unsafe_allow_html=True)
         st.write(
             "**DeepProbe** is an automated framework that enhances memory forensics by building upon the powerful **Volatility 3** engine. "
             "Its intelligent analysis engine correlates disparate artifacts from memory to identify complex threat patterns and uncover attack chains that might otherwise be missed."
         )
         st.markdown("---")
-        html_sidebar_supported_formats_title = "<h2><span style='text-decoration: none; color: inherit;'>Supported Formats</span></h2>"
-        html(html_sidebar_supported_formats_title, height=45)
+        st.markdown("<h2 style='color: #2ecc71;'>Supported Formats</h2>", unsafe_allow_html=True)
         st.info(f"Place your memory image file inside the `{html_escape(str(MEMORY_FOLDER.name))}/` folder.")
         st.markdown("- Raw Memory Dumps (`.raw`, `.mem`, `.bin`)\n- VMware Snapshots (`.vmem`)\n- Hibernation Files (`hiberfil.sys`)")
+        st.markdown("---")
+        
+        st.markdown("<h2 style='color: #2ecc71;'>Configuration</h2>", unsafe_allow_html=True)
+        if st.button("View Baseline"):
+            st.session_state.active_page = "Baseline"
+            st.rerun()
+
+        if st.button("View Detections"):
+            st.session_state.active_page = "Detections"
+            st.rerun()
+
 
         st.markdown('<div class="sidebar-footer">', unsafe_allow_html=True)
         if st.button("New Analysis / Home"):
@@ -957,6 +1053,126 @@ def main():
         render_home_page(status_text_global, progress_bar_global)
     elif st.session_state.active_page == "Results":
         render_results_page()
+    elif st.session_state.active_page == "Baseline":
+        render_baseline_page()
+    elif st.session_state.active_page == "Detections":
+        render_detections_page()
+
+def render_detections_page():
+    """Renders the detections rules page with tables for clarity."""
+    st.markdown("<h1 style='color: #2ecc71;'>DeepProbe Detection Rules</h1>", unsafe_allow_html=True)
+    st.write("This page displays the detection rules that the analysis engine uses to identify suspicious activity. The information is parsed directly from the `detections.yaml` file.")
+    
+    detections_config = load_detections_config()
+
+    if not detections_config:
+        st.warning("`detections.yaml` file not found or is empty. No detection rules are configured.")
+        return
+
+    os_profiles = detections_config.get('os_profiles', {})
+    for os_name, os_data in os_profiles.items():
+        st.markdown("---")
+        st.markdown(f"<h2 style='color: #2ecc71;'>{os_name.capitalize()} Detections</h2>", unsafe_allow_html=True)
+        
+        detections = os_data.get('detections', [])
+        if detections:
+            detection_data = []
+            for d in detections:
+                mitre_tags = ", ".join(d.get('mitre', []))
+                narrative_text = d.get('narrative', 'N/A').replace("psxview mismatch", "hidden process detection anomaly").replace("LdrModules", "loaded modules").replace("ldrmodules", "loaded modules")
+                
+                detection_data.append({
+                    "Detection Rule": d.get('title', d.get('id', 'N/A')),
+                    "Description": d.get('narrative', 'N/A'),
+                    "Narrative": narrative_text,
+                    "Severity Score": d.get('weight', 'N/A'),
+                    "MITRE ATT&CK®": mitre_tags
+                })
+            
+            df_detections = pd.DataFrame(detection_data)
+            st.dataframe(df_detections, use_container_width=True, hide_index=True)
+        else:
+            st.info(f"No detection rules found for {os_name.capitalize()}.")
+
+
+def render_baseline_page():
+    """Renders the baseline exclusions page with tables for clarity."""
+    st.markdown("<h1 style='color: #2ecc71;'>DeepProbe Baseline Exclusions</h1>", unsafe_allow_html=True)
+    st.write("This page displays the list of entities (processes, network connections, etc.) that are **intentionally ignored** during analysis based on the `baseline.yaml` file. These are considered normal, expected, or whitelisted for your environment.")
+
+    baseline_config = load_baseline_config()
+
+    if not baseline_config:
+        st.warning("`baseline.yaml` file not found or is empty. No exclusions are configured.")
+        return
+
+    # --- Render Process Whitelist ---
+    st.markdown("---")
+    st.markdown("<h2 style='color: #2ecc71;'>Excluded Processes</h2>", unsafe_allow_html=True)
+    st.write("The following processes are ignored by the analysis engine:")
+
+    process_data = []
+    process_whitelist = baseline_config.get('process_whitelist', {})
+    for os_type, processes in process_whitelist.items():
+        if processes:
+            for process in processes:
+                process_data.append({"Operating System": os_type.capitalize(), "Excluded Process Name": process})
+
+    if process_data:
+        df_processes = pd.DataFrame(process_data)
+        st.dataframe(df_processes, use_container_width=True, hide_index=True)
+    else:
+        st.info("No processes are currently whitelisted.")
+
+    # --- Render Network Whitelist ---
+    st.markdown("---")
+    st.markdown("<h2 style='color: #2ecc71;'>Excluded Network Connections</h2>", unsafe_allow_html=True)
+    st.write("The following IP addresses and ports are ignored by the analysis engine:")
+    
+    network_config = baseline_config.get('network', {})
+
+    # Allowed CIDRs
+    allow_cidrs = network_config.get('allow_cidrs', [])
+    if allow_cidrs:
+        st.markdown("### Allowed IP Addresses (CIDR)")
+        df_cidrs = pd.DataFrame({"CIDR": allow_cidrs})
+        st.dataframe(df_cidrs, use_container_width=True, hide_index=True)
+    else:
+        st.info("No IP addresses are currently whitelisted.")
+
+    # Allowed Ports
+    allow_ports = network_config.get('allow_ports', [])
+    if allow_ports:
+        st.markdown("### Allowed Ports")
+        df_ports = pd.DataFrame({"Port": allow_ports})
+        st.dataframe(df_ports, use_container_width=True, hide_index=True)
+    else:
+        st.info("No ports are currently whitelisted.")
+
+    # --- Render Sessions Whitelist ---
+    st.markdown("---")
+    st.markdown("<h2 style='color: #2ecc71;'>Excluded Sessions</h2>", unsafe_allow_html=True)
+    st.write("The following user sessions are ignored by the analysis engine:")
+
+    sessions_data = baseline_config.get('sessions', {}).get('ignore_users', [])
+    if sessions_data:
+        df_sessions = pd.DataFrame({"Excluded User": sessions_data})
+        st.dataframe(df_sessions, use_container_width=True, hide_index=True)
+    else:
+        st.info("No user sessions are currently whitelisted.")
+
+    # --- Render Command Line Whitelist (if it exists) ---
+    st.markdown("---")
+    st.markdown("<h2 style='color: #2ecc71;'>Command-Line Exclusions</h2>", unsafe_allow_html=True)
+    st.write("The following command-line patterns are whitelisted:")
+
+    cmdline_data = baseline_config.get('command_line_allowlist', [])
+    if cmdline_data:
+        df_cmdline = pd.DataFrame(cmdline_data)
+        st.dataframe(df_cmdline, use_container_width=True, hide_index=True)
+    else:
+        st.info("No command-line patterns are currently whitelisted.")
+
 
 def render_home_page(status_text_global, progress_bar_global):
     """Renders the main input form and analysis capabilities view."""
@@ -964,21 +1180,18 @@ def render_home_page(status_text_global, progress_bar_global):
     col1, col2 = st.columns([1, 1], gap="large")
 
     with col1:
-        html_new_analysis_job_title = "<h1><span style='text-decoration: none; color: inherit;'>New Analysis Job</span></h1>"
-        html(html_new_analysis_job_title, height=70)
+        st.markdown("<h1 style='color: #2ecc71;'>New Analysis Job</h1>", unsafe_allow_html=True)
         st.write("Configure your analysis by providing a project name and the memory image filename.")
 
         with st.form("analysis_form"):
-            project_name = st.text_input("**Project Name**", placeholder="e.g., Q4_Incident_Response")
-            memory_file_name = st.text_input("**Memory File Name**", placeholder="e.g., workstation-dump.raw")
-            ip_enrichment_api_key = st.text_input("**IP Enrichment API Key (Optional)**", type="password", help="Enter your API key for IP geo-location and reputation services.")
-            openai_api_key = st.text_input("**OpenAI API Key (Optional)**", type="password", help="Enter your OpenAI API key for AI-powered verdict and summary.")
+            project_name = st.text_input("**Project Name**")
+            memory_file_name = st.text_input("**Memory File Name**")
+            ip_enrichment_api_key = st.text_input("**IP Enrichment API Key (Optional)**", type="password")
             
             submitted = st.form_submit_button("Launch Analysis")
         
     with col2:
-        html_analysis_capabilities_title = "<h2><span style='text-decoration: none; color: inherit;'>Analysis Capabilities</span></h2>"
-        html(html_analysis_capabilities_title, height=50)
+        st.markdown("<h2 style='color: #2ecc71;'>Analysis Capabilities</h2>", unsafe_allow_html=True)
         st.markdown("""
             <div class="scan-widget-grid">
                 <div class="scan-widget"><div class="title">Hidden Process Detection</div></div>
@@ -999,36 +1212,44 @@ def render_home_page(status_text_global, progress_bar_global):
             progress_bar_global.empty()
         else:
             memory_file_path = MEMORY_FOLDER / memory_file_name
-            if not memory_file_path.exists():
-                st.error(f"File not found: '`{html_escape(memory_file_name)}`' does not exist in the '`{html_escape(str(MEMORY_FOLDER))}`' directory.")
-                status_text_global.empty()
-                progress_bar_global.empty()
-            else:
+            project_output_folder = OUTPUT_FOLDER / project_name
+            findings_jsonl_path = project_output_folder / "findings.jsonl"
+            
+            if findings_jsonl_path.exists():
+                st.warning(f"Report for project '`{html_escape(project_name)}`' already exists. Skipping analysis and showing saved results.")
+                st.session_state.analysis_successful = True
                 st.session_state.project_name = project_name
-                st.session_state.ip_enrichment_api_key = ip_enrichment_api_key
-                st.session_state.openai_api_key = openai_api_key
-
-                progress_bar_global.progress(0, text="0% Complete")
-
-                success = run_analysis_and_show_progress(
-                    project_name, memory_file_path,
-                    ip_enrichment_api_key,
-                    openai_api_key,
-                    progress_bar_global, status_text_global
-                )
-                
-                if success:
-                    st.session_state.active_page = "Results"
-                    time.sleep(1)
-                    st.rerun()
-                else:
+                time.sleep(2)
+                st.session_state.active_page = "Results"
+                st.rerun()
+            else:
+                if not memory_file_path.exists():
+                    st.error(f"File not found: '`{html_escape(memory_file_name)}`' does not exist in the '`{html_escape(str(MEMORY_FOLDER))}`' directory.")
                     status_text_global.empty()
                     progress_bar_global.empty()
+                else:
+                    st.session_state.project_name = project_name
+                    st.session_state.ip_enrichment_api_key = ip_enrichment_api_key
+    
+                    progress_bar_global.progress(0, text="0% Complete")
+    
+                    success = run_analysis_and_show_progress(
+                        project_name, memory_file_path,
+                        ip_enrichment_api_key,
+                        progress_bar_global, status_text_global
+                    )
+                    
+                    if success:
+                        st.session_state.active_page = "Results"
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        status_text_global.empty()
+                        progress_bar_global.empty()
 
 def render_results_page():
     """Renders the final report with all visualizations."""
-    html_results_for_title = f"<h1><span style='text-decoration: none; color: inherit;'>Results for: {html_escape(st.session_state.project_name)}</span></h1>"
-    html(html_results_for_title, height=70)
+    st.markdown(f"<h1 style='color: #2ecc71;'>Results for: {html_escape(st.session_state.project_name)}</h1>", unsafe_allow_html=True)
     detections_config = load_detections_config()
 
     if not st.session_state.analysis_successful:
@@ -1036,106 +1257,13 @@ def render_results_page():
         return
 
     findings = load_findings(st.session_state.project_name)
-    ai_verdict_from_file = load_ai_verdict(st.session_state.project_name)
 
     correlated_findings = [f for f in findings if f.get('id', '').startswith('correlation_')]
     regular_findings = [f for f in findings if not f.get('id', '').startswith('correlation_')]
 
     severity_counts, overall_severity_label, total_score = categorize_findings(findings, detections_config)
 
-    html_overall_verdict_title = "<h2><span style='text-decoration: none; color: inherit;'>Overall Verdict</span></h2>"
-    html(html_overall_verdict_title, height=50)
-    if ai_verdict_from_file.get('verdict') != 'N/A' and ai_verdict_from_file.get('plain_summary') != 'AI verdict not available.':
-        ai_data = ai_verdict_from_file
-
-        st.markdown(f"""
-            <div class="verdict-box ai-verdict">
-                <h2>AI Verdict: <span style='text-decoration: none; color: inherit;'>{html_escape(ai_data.get('verdict', 'N/A'))}</span></h2>
-                <p style='text-decoration: none;'><b>Summary:</b> {html_escape(ai_data.get('plain_summary', 'No summary provided by AI.'))}</p>
-        """, unsafe_allow_html=True)
-
-        html_key_findings_title = "<h3><span style='text-decoration: none; color: inherit;'>Key Findings</span></h3>"
-        html(html_key_findings_title, height=40)
-        key_findings_html = "<ul>"
-        if ai_data.get('key_findings'):
-            for finding_text in ai_data['key_findings']:
-                if "command and control" in finding_text.lower() or "c2" in finding_text.lower():
-                    key_findings_html += f"<li style='text-decoration: none;'>{html_escape(finding_text)} - _This indicates a communication channel used by attackers to remotely control the compromised system._</li>"
-                else:
-                    key_findings_html += f"<li style='text-decoration: none;'>{html_escape(finding_text)}</li>"
-        else:
-            key_findings_html += "<li style='text-decoration: none;'>No key findings identified by AI.</li>"
-        key_findings_html += "</ul>"
-        st.markdown(key_findings_html, unsafe_allow_html=True)
-
-        html_attack_chain_title = "<h3><span style='text-decoration: none; color: inherit;'>Attack Chain</span></h3>"
-        html(html_attack_chain_title, height=40)
-        attack_chain_html = "<ol>"
-        if ai_data.get('attack_chain'):
-            for step in ai_data['attack_chain']:
-                actor_str = f"<b>Process:</b> {html_escape(step.get('actor', {}).get('process', 'unknown'))} (PID: {html_escape(str(step.get('actor', {}).get('pid', 'unknown')))})"
-                if step.get('actor', {}).get('user') != 'unknown':
-                    actor_str += f", User: {html_escape(step.get('actor', {}).get('user'))}"
-                
-                target_str = ""
-                if step.get('target', {}).get('object') != 'unknown':
-                    target_str = f"<b>Target:</b> {html_escape(step.get('target', {}).get('object', 'unknown'))}"
-                elif step.get('target', {}).get('process') != 'unknown':
-                    target_str = f"<b>Target Process:</b> {html_escape(step.get('target', {}).get('process'))} (PID: {html_escape(str(step.get('target', {}).get('pid', 'unknown')))})"
-
-                correlation_note = ""
-                if step.get('correlation_id') and step['correlation_id'] != 'none':
-                    correlation_note = f" _(Correlated from {html_escape(step['correlation_id'].replace('correlation_', '').replace('_', ' '))})_"
-
-                step_action = html_escape(step.get('action', 'unknown action'))
-                if "command and control" in step_action.lower() or "c2" in step_action.lower():
-                    step_action += " - _This is the remote communication channel established by the attacker._"
-
-                attack_chain_html += (
-                    f"<li style='text-decoration: none;'>"
-                    f"[{html_escape(step.get('time_utc', 'unknown'))}] "
-                    f"{actor_str} {step_action}. "
-                    f"{target_str}{correlation_note}"
-                    f"</li>"
-                )
-        else:
-            attack_chain_html += "<li style='text-decoration: none;'>No attack chain generated by AI.</li>"
-        attack_chain_html += "</ol>"
-        
-        if ai_data.get('approx_ordering'):
-            st.markdown("<small style='text-decoration: none;'><i>Note: Attack chain ordering is approximate due to missing or inconsistent timestamps.</i></small>", unsafe_allow_html=True)
-
-        st.markdown(f"<p style='text-decoration: none;'><b>Potential Malware Family Match:</b> {html_escape(ai_data.get('malware_match', 'None apparent'))} (Confidence: {html_escape(ai_data.get('confidence', 'N/A'))})</p>", unsafe_allow_html=True)
-
-        html_anomalies_corrections_title = "<h3><span style='text-decoration: none; color: inherit;'>Anomalies and Corrections</span></h3>"
-        html(html_anomalies_corrections_title, height=40)
-        anomalies_html = ""
-        if ai_data.get('anomalies', {}).get('flags'):
-            anomalies_html += "<p style='text-decoration: none;'><b>Flags (Inconsistent Data):</b></p><ul>"
-            anomalies_html += "".join([f"<li style='text-decoration: none;'>{html_escape(flag)}</li>" for flag in ai_data['anomalies']['flags']])
-            anomalies_html += "</ul>"
-        if ai_data.get('anomalies', {}).get('corrections'):
-            anomalies_html += "<p style='text-decoration: none;'><b>Corrections Made:</b></p><ul>"
-            anomalies_html += "".join([f"<li style='text-decoration: none;'>Field: `{html_escape(corr.get('field'))}`, Original: `{html_escape(corr.get('original'))}`, Corrected: `{html_escape(corr.get('corrected'))}` (Reason: {html_escape(corr.get('reason'))})</li>" for corr in ai_data['anomalies']['corrections']])
-            anomalies_html += "</ul>"
-        
-        if not (ai_data.get('anomalies', {}).get('flags') or ai_data.get('anomalies', {}).get('corrections')):
-            anomalies_html = "<p style='text-decoration: none;'>No anomalies or corrections noted by AI.</p>"
-        st.markdown(anomalies_html, unsafe_allow_html=True)
-
-        html_glossary_title = "<h3><span style='text-decoration: none; color: inherit;'>Glossary</span></h3>"
-        html(html_glossary_title, height=40)
-        glossary_html = "<ul>"
-        if ai_data.get('glossary'):
-            glossary_html += "".join([f"<li style='text-decoration: none;'><b>{html_escape(term)}:</b> {html_escape(explanation)}</li>" for term, explanation in ai_data['glossary'].items()])
-        else:
-            glossary_html += "<li style='text-decoration: none;'>No glossary terms provided by AI.</li>"
-        glossary_html += "</ul>"
-        st.markdown(glossary_html, unsafe_allow_html=True)
-
-        st.markdown("<small style='text-decoration: none;'><i>Powered by OpenAI GPT. Please cross-reference with detailed findings.</i></small>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-        st.markdown("---")
+    st.markdown("<h2 style='color: #2ecc71;'>Overall Verdict</h2>", unsafe_allow_html=True)
 
     verdict_message = ""
     verdict_summary = ""
@@ -1162,14 +1290,11 @@ def render_results_page():
         verdict_summary = "DeepProbe's rule engine found no definitive signs of malware or suspicious attack patterns in the memory image."
         verdict_class = "informational"
 
-    # Use a generic verdict box if no AI verdict is available, or use a new one with a margin if AI verdict exists
-    verdict_box_style = "margin-top: 1.5rem;" if ai_verdict_from_file.get('verdict') != 'N/A' else ""
-
     st.markdown(f"""
-        <div class="verdict-box {verdict_class}" {"style='margin-top: 1.5rem;'" if ai_verdict_from_file.get('verdict') != 'N/A' else ""}>
-            <h2><span style='text-decoration: none; color: inherit;'>DeepProbe Rule-Based Verdict: {html_escape(verdict_message)}</span></h2>
-            <p style='text-decoration: none;'>{html_escape(verdict_summary)}</p>
-            <p style='text-decoration: none;'>Overall Risk Score: <b>{html_escape(str(total_score))}</b></p>
+        <div class="verdict-box {verdict_class}">
+            <h2 style='color: inherit;'>DeepProbe Rule-Based Verdict: <span style='text-decoration: none; color: inherit;'>{html_escape(verdict_message)}</span></h2>
+            <p style='text-decoration: none; color: inherit;'>{html_escape(verdict_summary)}</p>
+            <p style='text-decoration: none; color: inherit;'>Overall Risk Score: <b>{html_escape(str(total_score))}</b></p>
         </div>
     """, unsafe_allow_html=True)
 
@@ -1178,11 +1303,10 @@ def render_results_page():
         st.success("Analysis completed, and no suspicious findings were detected.")
         return
 
-    report_tab, artifacts_tab = st.tabs(["Analysis Report", "Raw Artifacts"]) # Removed emojis from tab titles
+    report_tab, artifacts_tab = st.tabs(["Analysis Report", "Raw Artifacts"])
 
     with report_tab:
-        html_analysis_summary_title = "<h2><span style='text-decoration: none; color: inherit;'>Analysis Summary</span></h2>"
-        html(html_analysis_summary_title, height=50)
+        st.markdown("<h2 style='color: #2ecc71;'>Analysis Summary</h2>", unsafe_allow_html=True)
         st.markdown(f"""
         <div class="severity-grid">
             <div class="severity-box critical"><div class="severity-title">Critical</div><div class="severity-count">{severity_counts['Critical']}</div></div>
@@ -1194,16 +1318,14 @@ def render_results_page():
         st.markdown("---")
 
         if correlated_findings:
-            html_attack_story_title = "<h2><span style='text-decoration: none; color: inherit;'>The Attack Story: How DeepProbe Uncovered the Threat</span></h2>"
-            html(html_attack_story_title, height=50)
+            st.markdown("<h2 style='color: #2ecc71;'>The Attack Story: How DeepProbe Uncovered the Threat</h2>", unsafe_allow_html=True)
             st.write("DeepProbe analyzed multiple indicators to build a high-confidence narrative of a potential attack. The following shows the attack flow step-by-step.")
             sorted_correlated_findings = sorted(correlated_findings, key=lambda f: f['weight'], reverse=True)
             for f in sorted_correlated_findings:
                 render_correlated_finding_narrative(f, detections_config)
             st.markdown("---")
 
-        html_findings_narrative_title = "<h2><span style='text-decoration: none; color: inherit;'>Findings Narrative</span></h2>"
-        html(html_findings_narrative_title, height=50)
+        st.markdown("<h2 style='color: #2ecc71;'>Findings Narrative</h2>", unsafe_allow_html=True)
         st.write("A quick overview of every suspicious activity detected and why it's considered an issue:")
 
         st.markdown("<div class='findings-narrative-list'>", unsafe_allow_html=True)
@@ -1217,14 +1339,13 @@ def render_results_page():
 
             st.markdown(f"""
                 <div class='findings-narrative-item {finding_severity_class}'>
-                    <strong style='text-decoration: none;'>{html_escape(f.get('title'))}:</strong> <span style='text-decoration: none;'>{html_escape(get_narrative(f.get('id'), detections_config))}</span>
+                    <strong style='color: #2ecc71;'>{html_escape(f.get('title'))}:</strong> <span style='color: #c9d1d9;'>{html_escape(get_narrative(f.get('id'), detections_config))}</span>
                 </div>
             """, unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
         st.markdown("---")
-
-        html_recent_commands_overview_title = "<h2><span style='text-decoration: none; color: inherit;'>Recent Commands Overview</span></h2>" # Removed emoji
-        html(html_recent_commands_overview_title, height=50)
+        
+        st.markdown("<h2 style='color: #2ecc71;'>Recent Commands Overview</h2>", unsafe_allow_html=True)
         st.write("Below are commands and command-line arguments identified as potentially suspicious or relevant from the memory image:")
         
         recent_commands_df_data = []
@@ -1261,8 +1382,7 @@ def render_results_page():
             st.info("No suspicious commands were found in the analysis.")
         st.markdown("---")
 
-        html_all_detected_activities_title = "<h2><span style='text-decoration: none; color: inherit;'>All Detected Activities: Detailed Findings</span></h2>"
-        html(html_all_detected_activities_title, height=50)
+        st.markdown("<h2 style='color: #2ecc71;'>All Detected Activities: Detailed Findings</h2>", unsafe_allow_html=True)
         st.write("Below are all individual suspicious activities found, ordered by severity.")
 
         sorted_regular_findings = sorted(regular_findings, key=lambda x: x.get('weight', 0), reverse=True)
@@ -1274,18 +1394,14 @@ def render_results_page():
                     finding_severity_class = band['label'].lower()
                     break
 
-            html_finding_title = f"<h3 style='color: #2c3e50;'><span style='text-decoration: none; color: inherit;'>{html_escape(f.get('title'))}</span></h3>"
-            
             st.markdown(f"""
             <div class="card {finding_severity_class}">
-            """, unsafe_allow_html=True)
-            html(html_finding_title, height=45)
-            st.markdown(f"""
-                <p style='text-decoration: none;'>Severity Score: <b>{html_escape(str(f.get('weight', 0)))}</b> | MITRE ATT&CK®: <code>{html_escape(", ".join(f.get('mitre', [])))}</code></p>
+                <h3 style='color: #2ecc71;'>{html_escape(f.get('title'))}</h3>
+                <p>Severity Score: <b>{html_escape(str(f.get('weight', 0)))}</b> | MITRE ATT&CK®: <code>{html_escape(", ".join(f.get('mitre', [])))}</code></p>
                 <div class="narrative-block">
-                    <p style='text-decoration: none;'><b>Why it's an issue:</b> {html_escape(get_narrative(f.get('id'), detections_config))}</p>
+                    <p><b>Why it's an issue:</b> {html_escape(get_narrative(f.get('id'), detections_config))}</p>
                 </div>
-                <p style='text-decoration: none;'><b>Supporting Evidence:</b></p>
+                <p><b>Supporting Evidence:</b></p>
             </div>
             """, unsafe_allow_html=True)
 
@@ -1293,19 +1409,14 @@ def render_results_page():
             st.markdown("---")
 
     with artifacts_tab:
-        html_downloadable_raw_artifacts_title = "<h2><span style='text-decoration: none; color: inherit;'>Downloadable Raw Artifacts</span></h2>" # Removed emoji
-        html(html_downloadable_raw_artifacts_title, height=50)
+        st.markdown("<h2 style='color: #2ecc71;'>Downloadable Raw Artifacts</h2>", unsafe_allow_html=True)
         
         project_artifacts_folder = OUTPUT_FOLDER / st.session_state.project_name / "artifacts"
         
-        print(f"[DEBUG] Artifacts folder path: {project_artifacts_folder}")
-
         if not st.session_state.analysis_successful:
             st.info("No artifacts available. Please run an analysis.")
-            print("[DEBUG] Analysis not successful or no project name, skipping artifact display.")
         elif not project_artifacts_folder.exists():
             st.warning(f"Artifacts folder does not exist: '`{html_escape(str(project_artifacts_folder))}`'. This might mean no artifacts were generated or the path is incorrect.")
-            print(f"[DEBUG] Artifacts folder does not exist: {project_artifacts_folder}")
         else:
             st.write("These are the raw text or CSV files generated during the scan. You can download them or view their content directly.")
 
@@ -1315,15 +1426,11 @@ def render_results_page():
                     artifact_files = [f for f in os.listdir(project_artifacts_folder) if os.path.isfile(os.path.join(project_artifacts_folder, f))]
                     # Filter for only .txt, .csv, .json, and .jsonl files for inline viewing
                     viewable_artifact_files = sorted([f for f in artifact_files if f.endswith(('.txt', '.csv', '.json', '.jsonl'))])
-                    
-                    print(f"[DEBUG] Found {len(artifact_files)} total files, {len(viewable_artifact_files)} viewable files in artifacts folder.")
                 else:
-                    print(f"[DEBUG] Artifacts folder does not exist: {project_artifacts_folder}")
                     viewable_artifact_files = []
 
                 if not artifact_files:
                     st.info("No raw artifact files were generated for this project.")
-                    print("[DEBUG] No artifact files found in the list after scanning folder.")
                 else:
                     st.markdown("---")
                     st.subheader("View Artifact File Content")
@@ -1351,7 +1458,6 @@ def render_results_page():
                                 st.text_area("File Content", text_content, height=400, key="artifact_text_viewer")
                         except Exception as view_e:
                             st.error(f"Error reading or displaying selected file '`{html_escape(selected_artifact_to_view)}`': {html_escape(str(view_e))}")
-                            print(f"[ERROR] Error viewing artifact file {selected_artifact_to_view}: {view_e}")
                     
                     st.markdown("---")
                     st.subheader("Download All Artifact Files")
@@ -1369,8 +1475,6 @@ def render_results_page():
                         
                         file_path = project_artifacts_folder / file_name
                         
-                        print(f"[DEBUG] Processing file: {file_name}")
-
                         is_file_present = file_path.exists()
                         card_class = ""
                         download_button_disabled = False
@@ -1382,8 +1486,8 @@ def render_results_page():
                         with cols[col_idx]:
                             st.markdown(f"""
                                 <div class="artifact-card {card_class}">
-                                    <h3 style='text-decoration: none;'><span style='text-decoration: none; color: inherit;'>{html_escape(display_title)}</span></h3>
-                                    <p style='text-decoration: none;'><small>{html_escape(description)}</small></p>
+                                    <h3 style='color: #2ecc71;'>{html_escape(display_title)}</h3>
+                                    <p><small>{html_escape(description)}</small></p>
                                     <div style="flex-grow: 1;"></div>
                                     """, unsafe_allow_html=True)
                             
@@ -1394,11 +1498,10 @@ def render_results_page():
                                         file_data = fp.read()
                                 except Exception as read_e:
                                     st.error(f"Error reading file '`{html_escape(file_name)}`': {html_escape(str(read_e))}")
-                                    print(f"[ERROR] Error reading artifact file {file_name}: {read_e}")
                                     download_button_disabled = True
 
                             st.download_button(
-                                label=f"Download {file_name}",
+                                label=f"Download",
                                 data=file_data,
                                 file_name=file_name,
                                 mime="application/octet-stream",
@@ -1410,8 +1513,6 @@ def render_results_page():
 
             except Exception as e:
                 st.error(f"Could not read or process artifact files from '`{html_escape(str(project_artifacts_folder))}`'. Error: {html_escape(str(e))}")
-                print(f"[ERROR] Outer artifact rendering loop failed: {e}")
 
 if __name__ == "__main__":
     main()
-

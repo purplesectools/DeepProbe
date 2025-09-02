@@ -23,14 +23,14 @@ os_profiles:
       - { name: "windows.pslist",               format: "csv"  }
       - { name: "windows.psscan",               format: "csv"  }
       - { name: "windows.psxview",              format: "csv"  }
-      - { name: "windows.pstree",               format: "txt"  } # Added for parent-child analysis
-      - { name: "windows.cmdline",              format: "csv"  } # Added for detailed command line analysis
+      - { name: "windows.pstree",               format: "txt"  }
+      - { name: "windows.cmdline",              format: "csv"  }
       - { name: "windows.netstat",              format: "csv",  fallback: ["windows.netscan"] }
       - { name: "windows.malfind",              format: "text" }
       - { name: "windows.hollowprocesses",      format: "text" }
       - { name: "windows.ldrmodules",           format: "text" }
       - { name: "windows.handles",              format: "text" }
-      - { name: "windows.svcscan",              format: "csv" } # Changed to CSV for easier parsing
+      - { name: "windows.svcscan",              format: "csv" }
       - { name: "windows.scheduled_tasks",      format: "text", fallback: ["windows.registry.scheduled_tasks"] }
       - { name: "windows.filescan",             format: "text" }
       - { name: "windows.registry.printkey",    format: "text" }
@@ -40,17 +40,36 @@ os_profiles:
         format: "csv"
       - name: "windows.getsids"
         format: "text"
-      # --- NEW WINDOWS PLUGINS ---
+      # --- NEW WINDOWS PLUGINS (kept your earlier adds + appended more) ---
       - { name: "windows.dlllist",              format: "csv"  }
       - { name: "windows.apihooks",             format: "text" }
-      - { name: "windows.devicetree",           format: "text" } # For drivers/device info
-      - { name: "windows.modscan",              format: "text" } # For kernel modules
-      - { name: "windows.consoles",             format: "text" } # Command history for cmd.exe
+      - { name: "windows.devicetree",           format: "text" }
+      - { name: "windows.modscan",              format: "text" }
+      - { name: "windows.consoles",             format: "text" }
       - { name: "windows.clipboard",            format: "text" }
-      - { name: "windows.registry.shimcache",   format: "csv"  } # Execution evidence
-      - { name: "windows.registry.amcache",     format: "csv"  } # Execution evidence
-      - { name: "windows.envars",               format: "text" } # Environment variables
-        
+      - { name: "windows.registry.shimcache",   format: "csv"  }
+      - { name: "windows.registry.amcache",     format: "csv"  }
+      - { name: "windows.envars",               format: "text" }
+      # --- ADDITIONAL PLUGINS TO ENABLE NEW DETECTIONS ---
+      - { name: "windows.ssdt",                 format: "text" }
+      - { name: "windows.callbacks",            format: "text" }
+      - { name: "windows.iat",                  format: "text" }
+      - { name: "windows.vadinfo",              format: "text" }
+      - { name: "windows.vadwalk",              format: "text" }
+      - { name: "windows.suspicious_threads",   format: "text" }
+      - { name: "windows.suspended_threads",    format: "text" }
+      - { name: "windows.thrdscan",             format: "text" }
+      - { name: "windows.netscan",              format: "csv"  }
+      - { name: "windows.verinfo",              format: "csv"  }
+      - { name: "windows.strings",              format: "text" }
+      - { name: "windows.modules",              format: "text" }
+      - { name: "windows.registry.hivelist",    format: "text" }
+      - { name: "windows.registry.hivescan",    format: "text" }
+      - { name: "windows.registry.getcellroutine", format: "text" }
+      - { name: "windows.statistics",           format: "text" }
+      - { name: "windows.pedump",               format: "text" }
+      - { name: "windows.shimcachemem",         format: "text" }
+
     engines:
       - engine_id: network_enrichment
         description: Enriches network connections with geographic and reputation data.
@@ -96,8 +115,34 @@ os_profiles:
             - primary_ids: ["psxview_hidden", "malfind_injection", "ldr_unlinked_module"]
               secondary_ids: ["suspicious_connection", "suspicious_network_enrichment", "suspicious_port_activity"]
 
+      # --- NEW CORRELATION RULES ---
+      - id: correlation_kernel_rootkit
+        title: High-Confidence Threat (Kernel Rootkit Detected)
+        narrative: "This is a critical finding. Multiple indicators point to a kernel-level rootkit actively hiding processes, drivers, or system modifications. The attacker has deep control over the system, making detection difficult without specialized tools."
+        mitre: ["T1014", "T1562.001"]
+        weight: 15
+        engine: correlated_findings
+        enabled: true
+        evidence_fields: ["correlated_finding_ids"]
+        params:
+          correlation_pairs:
+            - primary_ids: ["ssdt_hooks_suspicious", "kernel_callbacks_suspicious", "registry_getcellroutine_hooked", "modules_hidden_vs_modscan"]
+              secondary_ids: ["psxview_hidden", "ldr_unlinked_module", "registry_orphan_hives"]
+
+      - id: correlation_evasive_execution
+        title: High-Confidence Threat (Evasive Execution and Hiding)
+        narrative: "A highly evasive threat was detected. This finding correlates execution from unusual locations with advanced techniques like IAT redirection or VAD anomalies, suggesting an attacker is actively executing code while trying to avoid detection."
+        mitre: ["T1055", "T1036"]
+        weight: 15
+        engine: correlated_findings
+        enabled: true
+        evidence_fields: ["correlated_finding_ids"]
+        params:
+          correlation_pairs:
+            - primary_ids: ["vad_exec_private", "iat_redirection", "threads_start_outside_module"]
+              secondary_ids: ["unknown_process_name", "exec_from_tmp", "suspicious_cmdline_args", "verinfo_mismatch"]
+
       # --- Network Related Detections (Critical - Weight: 15) ---
-      # NEW DETECTION: For Malicious Reputation
       - id: suspicious_network_malicious_ip
         title: Network connections to malicious IPs
         narrative: "The system is communicating with known malicious IP addresses, which are often associated with cybercriminals or hostile infrastructure. This is a very strong sign of an active compromise, potentially for Command and Control (C2) or data theft."
@@ -110,18 +155,11 @@ os_profiles:
           allow_cidrs_ref: "baseline.network.allow_cidrs"
         logic:
           - rule_id: malicious_reputation
-            match:
-              - field: "reputation"
-                value: "Malicious"
-                operator: "=="
+            match: [{ field: "reputation", value: "Malicious", operator: "==" }]
           - rule_id: suspicious_reputation
-            match:
-              - field: "reputation"
-                value: "Suspicious"
-                operator: "=="
+            match: [{ field: "reputation", value: "Suspicious", operator: "==" }]
 
-      # MODIFIED DETECTION: For Suspicious Foreign Locations
-      - id: suspicious_network_enrichment # Keep this ID, but adjust logic for country only
+      - id: suspicious_network_enrichment
         title: Network connections to suspicious foreign locations
         narrative: "The system is communicating with IP addresses located in countries identified as suspicious. While not inherently malicious, traffic to these locations can indicate unauthorized activity, data exfiltration, or communication with command and control infrastructure in high-risk regions."
         mitre: ["T1071", "TA0011"]
@@ -132,36 +170,20 @@ os_profiles:
         params:
           allow_cidrs_ref: "baseline.network.allow_cidrs"
         logic:
-          # Each country is now a separate rule_id, so they are OR'd by the engine
           - rule_id: suspicious_location_ru
-            match:
-              - field: country
-                value: "RU"
+            match: [{ field: country, value: "RU" }]
           - rule_id: suspicious_location_cn
-            match:
-              - field: country
-                value: "CN"
+            match: [{ field: country, value: "CN" }]
           - rule_id: suspicious_location_kp
-            match:
-              - field: country
-                value: "KP"
+            match: [{ field: country, value: "KP" }]
           - rule_id: suspicious_location_fr
-            match:
-              - field: country
-                value: "FR"
+            match: [{ field: country, value: "FR" }]
           - rule_id: suspicious_location_be
-            match:
-              - field: country
-                value: "BE"
+            match: [{ field: country, value: "BE" }]
           - rule_id: suspicious_location_ir
-            match:
-              - field: country
-                value: "IR"
+            match: [{ field: country, value: "IR" }]
           - rule_id: suspicious_location_cu
-            match:
-              - field: country
-                value: "CU"
-
+            match: [{ field: country, value: "CU" }]
 
       - id: suspicious_connection
         title: Suspicious external connection (non-whitelisted)
@@ -185,17 +207,8 @@ os_profiles:
         enabled: true
         evidence_fields: ["pid", "owner", "Proto", "LocalPort", "ForeignPort"]
         params:
-          suspicious_ports:
-            - 31337
-            - 4444
-            - 1337
-            - 8888
-            - 9999
-            - 10000
-            - 6881
-            - 6969
-            - 2222
-      
+          suspicious_ports: [31337, 4444, 1337, 8888, 9999, 10000, 6881, 6969, 2222]
+
       # --- Confirmed Detections (High - Weight: 10) ---
       - id: psxview_hidden
         title: Hidden or unlinked process (psxview mismatch)
@@ -255,6 +268,133 @@ os_profiles:
             - "\\\\users\\\\[^\\\\]+\\\\downloads\\\\"
             - "\\\\recycle"
 
+      # --- NEW High / Medium Detections (added; schema unchanged) ---
+      - id: ssdt_hooks_suspicious
+        title: Suspicious SSDT hooks (kernel tampering)
+        narrative: "System call table entries point outside expected kernel modules. This strongly suggests kernel-level hooking by rootkits or EDR tampering."
+        mitre: ["T1014","T1562.001"]
+        weight: 10
+        engine: windows_ssdt_hooks
+        enabled: true
+        evidence_fields: ["Index","Table","Target","OwnerModule","Notes"]
+        params:
+          allowed_modules_regex: "(?i)(ntoskrnl|win32k|ntkrnl|hal)\\.sys"
+
+      - id: kernel_callbacks_suspicious
+        title: Suspicious kernel callbacks
+        narrative: "Unexpected or duplicate kernel callbacks for process/thread/image/registry notifications owned by unknown or unsigned drivers."
+        mitre: ["T1014","T1562.001"]
+        weight: 10
+        engine: windows_callbacks_suspicious
+        enabled: true
+        evidence_fields: ["Type","Callback","OwnerModule"]
+        params:
+          known_good_modules_regex: "(?i)(ntoskrnl|win32k|hal|fltmgr|ndis|tcpip)\\.sys"
+
+      - id: iat_redirection
+        title: IAT redirection to non-module memory
+        narrative: "Import Address Table entries resolved to regions not backed by expected modules, indicating inline hooks or userland patching."
+        mitre: ["T1055","T1562.001"]
+        weight: 10
+        engine: iat_redirection
+        enabled: true
+        evidence_fields: ["pid","process","Module","Function","ResolvedTo","RegionType"]
+
+      - id: vad_exec_private
+        title: Executable private memory regions (VAD)
+        narrative: "Private RX/RWX memory regions strongly suggest code injection or unpacked payloads."
+        mitre: ["T1055"]
+        weight: 10
+        engine: vad_private_rx
+        enabled: true
+        evidence_fields: ["pid","process","Start","End","Protection","Tag","File"]
+        params:
+          require_executable: true
+
+      - id: threads_start_outside_module
+        title: Thread start address outside loaded modules
+        narrative: "Threads starting in unmapped memory or outside image sections are indicative of shellcode execution."
+        mitre: ["T1055"]
+        weight: 10
+        engine: threads_start_outside_module
+        enabled: true
+        evidence_fields: ["pid","process","ThreadId","StartAddress","ModuleAtStart"]
+
+      - id: netscan_beacon_like
+        title: Beacon-like network pattern
+        narrative: "Outbound connections from unusual processes to remote hosts/ports consistent with C2 beaconing."
+        mitre: ["T1071"]
+        weight: 10
+        engine: netscan_beacon_like
+        enabled: true
+        evidence_fields: ["pid","owner","LocalAddr","LocalPort","ForeignAddr","ForeignPort","State"]
+        params:
+          suspicious_process_regex: "(?i)(rundll32|regsvr32|wmic|mshta|powershell|wscript|cscript|certutil|cmd)\\.exe"
+
+      - id: verinfo_mismatch
+        title: PE version info mismatch
+        narrative: "Product/Company fields do not match filename or path, or missing version info for binaries in system directories."
+        mitre: ["T1036"]
+        weight: 5
+        engine: verinfo_mismatch
+        enabled: true
+        evidence_fields: ["pid","process","Path","CompanyName","ProductName","FileDescription"]
+        params:
+          system_dir_regex: "(?i)\\\\windows\\\\(system32|syswow64)\\\\"
+
+      - id: strings_sensitive_iocs
+        title: Sensitive IOCs in process memory (strings)
+        narrative: "Credentials, toolnames, URLs, or encoded commands found in process memory; attributed to owning PID."
+        mitre: ["T1552","T1105","T1059"]
+        weight: 5
+        engine: strings_ioc_match
+        enabled: true
+        evidence_fields: ["pid","process","Offset","String"]
+        params:
+          patterns:
+            - "(?i)password="
+            - "(?i)Authorization:"
+            - "(?i)Invoke-"
+            - "(?i)mimikatz"
+            - "(?i)(http|https)://[a-z0-9\\.-]+"
+            - "(?i)\\b[A-Za-z0-9+/=]{20,}\\b"
+
+      - id: modules_hidden_vs_modscan
+        title: Hidden kernel modules (list vs scan)
+        narrative: "Modules found by pool scan (modscan) but not in module list indicate hidden drivers/rootkits."
+        mitre: ["T1014"]
+        weight: 10
+        engine: modules_vs_modscan_diff
+        enabled: true
+        evidence_fields: ["Module","Base","PresentInList","PresentInScan"]
+
+      - id: registry_getcellroutine_hooked
+        title: Registry hive GetCellRoutine hook
+        narrative: "Hooked registry GetCellRoutine indicates registry virtualization/tampering to hide keys/values."
+        mitre: ["T1112","T1562.001"]
+        weight: 10
+        engine: registry_getcellroutine_hook
+        enabled: true
+        evidence_fields: ["Hive","Status","HookTarget"]
+
+      - id: registry_orphan_hives
+        title: Orphan or hidden registry hives (hivescan)
+        narrative: "Hives present by scan but not by list-walk suggest hidden/off-book configuration or persistence."
+        mitre: ["T1112","T1014"]
+        weight: 5
+        engine: registry_orphan_hives
+        enabled: true
+        evidence_fields: ["HivePath","Offset","PresentInList"]
+
+      - id: statistics_profile_anomaly
+        title: System statistics anomaly vs baseline
+        narrative: "Unusual counts of processes/threads/handles or memory profile outliers for the OS build; may indicate staging or tampering."
+        mitre: ["TA0005"]
+        weight: 2
+        engine: statistics_baseline_anomaly
+        enabled: true
+        evidence_fields: ["Metric","Value","ExpectedRange"]
+
       # --- Probable Detections (Medium - Weight: 5) ---
       - id: suspicious_cmdline_args
         title: Process with suspicious command-line arguments
@@ -297,8 +437,8 @@ os_profiles:
             - 'Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run'
             - 'Software\\Microsoft\\Windows NT\\CurrentVersion\\Windows\\Run'
             - 'Software\\Microsoft\\Windows\\CurrentVersion\\RunServices'
-            - 'Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run' # Added for 32-bit apps on 64-bit systems
-            - 'Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce' # Added for 32-bit apps on 64-bit systems
+            - 'Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run'
+            - 'Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\RunOnce'
           value_regex: "(?i)(exe|dll|js|vbs|ps1|bat|cmd|hta|py|vbe|jse)" # Look for common executable/script extensions
 
       - id: unknown_process_name
@@ -348,7 +488,6 @@ os_profiles:
             - "\\\\programdata\\\\.*\\\\temp"
             - "\\\\windows\\\\temp"
             - "\\\\public\\\\"
-          # You might add keywords for suspicious service names/display names here too
 
       - id: scheduled_tasks_suspicious
         title: Suspicious scheduled task (script in user-writable path)
@@ -405,10 +544,11 @@ os_profiles:
             - "\\\\downloads\\\\"
             - "(deleted)"
             - "\\\\programdata\\\\"
-          any_file_ext: ["py","py.txt","ps1","vbs","js","exe","bat","cmd","txt","dll","docm","xlsm","zip","rar"]
+          any_file_ext: ["py","py.txt","ps1","vbs","js","exe","bat","cmd","hta","vbe","jse"]
           any_name_contains: ["mimikatz","invoke-","meterpreter","cobalt","beacon","powershell",
-                               "vip.txt","secret","password","loot","dump","creds","nc.exe",
-                               "psexec","sccm","certutil","bitsadmin","lazagne","procdump"]
+                               "secret","password","loot","dump","creds","nc.exe","privesc",
+                               "psexec","sccm","certutil","bitsadmin","lazagne","procdump",
+                               "sharp","rce","exploit","backdoor","shellcode","stager"]
 
       - id: registry_recentdocs_py_exe
         title: RecentDocs shows scripts/binaries of interest
@@ -422,11 +562,10 @@ os_profiles:
           keys:
             - 'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs\\.py'
             - 'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs\\.exe'
-            - 'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs\\.txt'
             - 'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs\\.js'
             - 'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs\\.vbs'
             - 'Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\RecentDocs\\.ps1'
-          value_regex: "(?i)(evil|demon|mimikatz|nc|powershell|vip\\.txt|\\.py(\\.txt)?|cobalt|beacon|c2|payload)"
+          value_regex: "(?i)(evil|demon|mimikatz|nc\\.(exe|ps1)|powershell -enc|vip\\.txt|cobalt|beacon|c2|payload|exploit|backdoor|shellcode|stager)"
 
       - id: handles_dangerous_access
         title: Dangerous process/thread handle access (general)
@@ -461,12 +600,17 @@ os_profiles:
       - { name: "linux.check_modules",   format: "text" }
       - { name: "linux.bash",            format: "text" }
       # --- NEW LINUX PLUGINS ---
-      - { name: "linux.envars",          format: "text" } # Environment variables
-      - { name: "linux.librarylist",     format: "text" } # Loaded libraries
-      - { name: "linux.lsmod",           format: "text" } # Kernel modules
+      - { name: "linux.envars",          format: "text" }
+      - { name: "linux.librarylist",     format: "text" }
+      - { name: "linux.lsmod",           format: "text" }
+      - { name: "linux.bash",            format: "text" }
+      - { name: "linux.lsof",            format: "csv" }
+      - { name: "linux.sockstat",        format: "csv" }
+      - { name: "linux.check_syscall",   format: "text" }
+      - { name: "linux.check_modules",   format: "text" }
 
     detections:
-      - id: suspicious_network_malicious_ip # NEW DETECTION ID
+      - id: suspicious_network_malicious_ip
         title: Network connections to malicious IPs
         narrative: "The system is communicating with known malicious IP addresses, which are often associated with cybercriminals or hostile infrastructure. This is a very strong sign of an active compromise, potentially for Command and Control (C2) or data theft."
         mitre: ["T1071", "TA0011"]
@@ -488,7 +632,7 @@ os_profiles:
                 value: "Suspicious"
                 operator: "=="
 
-      - id: suspicious_network_enrichment # MODIFIED LOGIC
+      - id: suspicious_network_enrichment
         title: Network connections to suspicious foreign locations
         narrative: "The system is communicating with IP addresses located in countries identified as suspicious. While not inherently malicious, traffic to these locations can indicate unauthorized activity, data exfiltration, or communication with command and control infrastructure in high-risk regions."
         mitre: ["T1071", "TA0011"]
@@ -499,36 +643,21 @@ os_profiles:
         params:
           allow_cidrs_ref: "baseline.network.allow_cidrs"
         logic:
-          # Each country is now a separate rule_id, so they are OR'd by the engine
           - rule_id: suspicious_location_ru
-            match:
-              - field: country
-                value: "RU"
+            match: [{ field: country, value: "RU" }]
           - rule_id: suspicious_location_cn
-            match:
-              - field: country
-                value: "CN"
+            match: [{ field: country, value: "CN" }]
           - rule_id: suspicious_location_kp
-            match:
-              - field: country
-                value: "KP"
+            match: [{ field: country, value: "KP" }]
           - rule_id: suspicious_location_fr
-            match:
-              - field: country
-                value: "FR"
+            match: [{ field: country, value: "FR" }]
           - rule_id: suspicious_location_be
-            match:
-              - field: country
-                value: "BE"
+            match: [{ field: country, value: "BE" }]
           - rule_id: suspicious_location_ir
-            match:
-              - field: country
-                value: "IR"
+            match: [{ field: country, value: "IR" }]
           - rule_id: suspicious_location_cu
-            match:
-              - field: country
-                value: "CU"
-      
+            match: [{ field: country, value: "CU" }]
+
       - id: suspicious_connection
         title: Suspicious external connection
         narrative: "An unexpected network connection to a server outside your trusted network was found. This could indicate an attacker communicating with a remote server for control, data exfiltration, or downloading more malicious tools."
@@ -550,16 +679,7 @@ os_profiles:
         enabled: true
         evidence_fields: ["pid", "owner", "Proto", "LocalPort", "ForeignPort"]
         params:
-          suspicious_ports:
-            - 31337
-            - 4444
-            - 1337
-            - 8888
-            - 9999
-            - 10000
-            - 6881
-            - 6969
-            - 2222
+          suspicious_ports: [31337, 4444, 1337, 8888, 9999, 10000, 6881, 6969, 2222]
       
       - id: correlation_evasion_network
         title: High-Confidence Threat (Evasion + Network Activity)
@@ -657,13 +777,13 @@ os_profiles:
       - { name: "mac.malfind",       format: "text" }
       - { name: "mac.bash",          format: "text" }
       # --- NEW MACOS PLUGINS ---
-      - { name: "mac.sessions",      format: "csv"  } # User sessions
-      - { name: "mac.mount",         format: "text" } # Mounted volumes
-      - { name: "mac.volumes",       format: "text" } # Volume information
-      - { name: "mac.dmesg",         format: "text" } # System log
+      - { name: "mac.sessions",      format: "csv"  }
+      - { name: "mac.mount",         format: "text" }
+      - { name: "mac.volumes",       format: "text" }
+      - { name: "mac.dmesg",         format: "text" }
 
     detections:
-      - id: suspicious_network_malicious_ip # NEW DETECTION ID
+      - id: suspicious_network_malicious_ip
         title: Network connections to malicious IPs
         narrative: "The system is communicating with known malicious IP addresses, which are often associated with cybercriminals or hostile infrastructure. This is a very strong sign of an active compromise, potentially for Command and Control (C2) or data theft."
         mitre: ["T1071", "TA0011"]
@@ -685,7 +805,7 @@ os_profiles:
                 value: "Suspicious"
                 operator: "=="
 
-      - id: suspicious_network_enrichment # MODIFIED LOGIC
+      - id: suspicious_network_enrichment
         title: Network connections to suspicious foreign locations
         narrative: "The system is communicating with IP addresses located in countries identified as suspicious. While not inherently malicious, traffic to these locations can indicate unauthorized activity, data exfiltration, or communication with command and control infrastructure in high-risk regions."
         mitre: ["T1071", "TA0011"]
@@ -696,35 +816,20 @@ os_profiles:
         params:
           allow_cidrs_ref: "baseline.network.allow_cidrs"
         logic:
-          # Each country is now a separate rule_id, so they are OR'd by the engine
           - rule_id: suspicious_location_ru
-            match:
-              - field: country
-                value: "RU"
+            match: [{ field: country, value: "RU" }]
           - rule_id: suspicious_location_cn
-            match:
-              - field: country
-                value: "CN"
+            match: [{ field: country, value: "CN" }]
           - rule_id: suspicious_location_kp
-            match:
-              - field: country
-                value: "KP"
+            match: [{ field: country, value: "KP" }]
           - rule_id: suspicious_location_fr
-            match:
-              - field: country
-                value: "FR"
+            match: [{ field: country, value: "FR" }]
           - rule_id: suspicious_location_be
-            match:
-              - field: country
-                value: "BE"
+            match: [{ field: country, value: "BE" }]
           - rule_id: suspicious_location_ir
-            match:
-              - field: country
-                value: "IR"
+            match: [{ field: country, value: "IR" }]
           - rule_id: suspicious_location_cu
-            match:
-              - field: country
-                value: "CU"
+            match: [{ field: country, value: "CU" }]
 
       - id: suspicious_connection
         title: Suspicious external connection
@@ -747,16 +852,7 @@ os_profiles:
         enabled: true
         evidence_fields: ["pid", "owner", "Proto", "LocalPort", "ForeignPort"]
         params:
-          suspicious_ports:
-            - 31337
-            - 4444
-            - 1337
-            - 8888
-            - 9999
-            - 10000
-            - 6881
-            - 6969
-            - 2222
+          suspicious_ports: [31337, 4444, 1337, 8888, 9999, 10000, 6881, 6969, 2222]
       
       - id: correlation_evasion_network
         title: High-Confidence Threat (Evasion + Network Activity)
@@ -805,7 +901,7 @@ os_profiles:
           temp_like_paths: ["/tmp/", "/private/tmp/", "/var/folders/", "/Users/[^/]+/Downloads/"]
 
       - id: bash_history_suspicious
-        title: Suspicious commands in Bash history
+        title: "Suspicious commands in Bash history"
         narrative: "Commands that are often associated with malicious activities (e.g., downloading tools, deleting logs, privilege escalation attempts) were found in the user's Bash command history. This suggests a user, or an attacker using a user's account, has performed suspicious actions on the system."
         mitre: ["T1059.004", "T1070.003"]
         weight: 5
@@ -828,4 +924,3 @@ os_profiles:
             - "sshpass"
             - "msfvenom"
             - "/dev/tcp/"
-
