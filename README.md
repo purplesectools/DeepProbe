@@ -1,19 +1,18 @@
 DeepProbe: Unmasking Hidden Threats in Memory
 Automated Memory Forensics Framework with AI-Powered Intelligence
-
 Introduction: Why DeepProbe?
 In today's sophisticated threat landscape, attackers often operate in memory, leaving minimal traces on disk. Traditional forensic tools can be cumbersome, slow, and require deep manual expertise, leading to missed artifacts and prolonged incident response times. DeepProbe changes the game.
 
-DeepProbe is not just another memory forensics tool; it's an intelligent, automated framework engineered to accelerate threat hunting and incident response. By integrating the power of Volatility 3 with an adaptive detection engine and Gemini AI-powered analytics, DeepProbe transforms raw memory dumps into actionable intelligence. It helps security analysts, forensic investigators, and threat hunters quickly uncover complex attack patterns, identify hidden processes, and reconstruct attack chains with unprecedented clarity.
+DeepProbe is not just another memory forensics tool; it's an intelligent, automated framework engineered to accelerate threat hunting and incident response. By integrating the power of the Volatility 3 Framework with an adaptive detection engine and AI-powered analytics, DeepProbe transforms raw memory dumps into actionable intelligence. It helps security analysts, forensic investigators, and threat hunters quickly uncover complex attack patterns, identify hidden processes, and reconstruct attack chains with unprecedented clarity.
 
 What Makes DeepProbe Different?
 DeepProbe stands out through its unique blend of automation, intelligence, and user-centric design:
 
-Intelligent Correlation Engine: Unlike tools that just list individual findings, DeepProbe's core strength lies in its ability to correlate disparate forensic artifacts. It doesn't just show you a suspicious network connection; it links it to a hidden process, a code injection, and a persistence mechanism to paint a comprehensive picture of an attack. This drastically reduces false positives and highlights true threats.
+Intelligent Correlation Engine: Instead of just listing individual findings, DeepProbe's core strength is its ability to correlate disparate forensic artifacts. It doesn't just show you a suspicious network connection; it links it to a hidden process, a code injection, and a persistence mechanism to paint a comprehensive picture of an attack. This drastically reduces false positives and highlights true threats.
 
-AI-Powered Insights (Gemini API Integration): DeepProbe integrates with cutting-edge AI (specifically the Gemini API) to provide natural language summaries, key findings, and attack chain narratives. Imagine an AI assistant automatically explaining the "story" of an attack, detailing the attacker's tactics, techniques, and procedures (TTPs), and even suggesting potential malware families. This democratizes advanced forensics, making complex findings understandable to a wider audience.
+AI-Powered Insights: DeepProbe integrates with the Gemini API to provide natural language summaries, key findings, and attack chain narratives. This feature democratizes advanced forensics, making complex findings understandable to a wider audience.
 
-Automated Contextualization: DeepProbe goes beyond raw data. It automatically enriches findings with contextual information, such as IP geo-location and reputation, providing immediate insights into external connections.
+Automated Contextualization: DeepProbe goes beyond raw data by automatically enriching findings with contextual information, such as IP geo-location and reputation, for immediate insights into external connections.
 
 Streamlined User Experience: A clean, intuitive Streamlit UI abstracts away the complexities of command-line Volatility, making powerful memory forensics accessible even for those without extensive CLI experience.
 
@@ -26,52 +25,18 @@ Adaptive Detection Engine: A YAML-configurable rule engine identifies known mali
 
 Multi-Stage Attack Chain Reconstruction: Automatically correlates findings across processes, network connections, code injections, and persistence mechanisms to build a coherent attack narrative.
 
-AI-Generated Verdicts & Summaries: Integrates with the Gemini API to provide:
+AI-Generated Verdicts & Summaries: Provides high-level verdicts, plain-English summaries, and detailed attack chain steps.
 
-High-level verdicts (e.g., "MALWARE: HIGHLY LIKELY").
-
-Plain English summaries of the entire analysis.
-
-Extracted key findings and detailed attack chain steps.
-
-Potential malware family matches and confidence scores.
-
-Identification of anomalies and corrections made during AI interpretation.
-
-Interactive Streamlit UI:
-
-Easy configuration of analysis jobs.
-
-Real-time progress updates during scans.
-
-Header-based navigation for quick access to core features.
+Interactive Streamlit UI: Offers easy configuration of analysis jobs and real-time progress updates.
 
 Comprehensive Reporting: Generates detailed reports in various formats (HTML, JSONL) for documentation and further investigation.
 
-Raw Artifact Access: Provides direct access to raw output files from Volatility plugins (CSV, TXT, JSON) for deeper, manual investigation.
-
-IP Enrichment: Integrates with AbuseIPDB to provide geo-location and reputation context for suspicious IP addresses found in network artifacts.
+IP Enrichment: Integrates with AbuseIPDB to provide geo-location and reputation context for suspicious IP addresses.
 
 Cross-Platform Support: Analyze memory dumps from Windows, Linux, and macOS systems.
 
-How DeepProbe Works (Technical Overview)
-Memory Image Acquisition: Users provide a raw memory dump file (e.g., .raw, .vmem, hiberfil.sys).
-
-Volatility 3 Execution: DeepProbe orchestrates the execution of various Volatility 3 plugins, extracting a wide array of forensic artifacts (e.g., process lists, network connections, loaded modules, registry keys, command line history).
-
-Artifact Pre-processing: Raw Volatility output is parsed, normalized, and structured into a machine-readable format.
-
-Detection Engine Analysis: A YAML-defined rule engine (detections.yaml, baseline.yaml) scans the extracted artifacts for suspicious indicators, known malware patterns, and deviations from a baseline.
-
-Correlation Engine: This is where DeepProbe's intelligence shines. It takes individual findings and cross-references them to identify causal links and temporal relationships. For example, a hidden process, a code injection in that process, and an outbound network connection from it would be correlated into a single "Attack Chain" finding.
-
-IP Enrichment (Optional): If an API key is provided, detected external IP addresses are enriched with geo-location and reputation data from AbuseIPDB.
-
-
-Report Generation: All findings, correlations, and AI insights are compiled into an interactive Streamlit UI and comprehensive output files.
-
 Getting Started
-To run DeepProbe, you'll need Docker installed on your system.
+DeepProbe runs securely within a Docker container.
 
 Prerequisites
 Docker Desktop: Install Docker Desktop for macOS, Windows, or your preferred Docker engine for Linux. Ensure it's running before proceeding.
@@ -106,32 +71,29 @@ An empty out/ subdirectory (create this if it doesn't exist)
 Building the Docker Image
 Navigate to your project directory in the terminal and build the Docker image:
 
-Bash
-
 docker build -t deeprobe-app .
-This command downloads the necessary Python and Debian base images, installs Volatility 3, sets up Python dependencies, and packages your DeepProbe application. This might take a few minutes for the first build.
+
+This command downloads the necessary base images, installs Volatility 3, sets up Python dependencies, and packages your DeepProbe application. This might take a few minutes for the first build.
 
 Running the Application (Securely Local)
 To run DeepProbe and access it securely from your local machine (browser), follow these steps:
 
 Create an Isolated Docker Network: This provides an additional layer of network isolation for your container.
 
-Bash
-
 docker network create isolated-net
-Run the Container on the Isolated Network: This command ensures the application is only accessible via localhost and not exposed on any public or network IP addresses.
 
-Bash
+Run the Container on the Isolated Network: This command ensures the application is only accessible via localhost and is not exposed on any public or network IP addresses.
 
 docker run --rm --network=isolated-net -p 127.0.0.1:8501:8501 \
-  -v $(pwd)/memory:/app/memory \
-  -v $(pwd)/out:/app/out \
-  deeprobe-app
+    -v "$(pwd)"/memory:/app/memory \
+    -v "$(pwd)"/out:/app/out \
+    deeprobe-app
+
 -p 127.0.0.1:8501:8501: Maps port 8501 inside the container to port 8501 on your host machine, specifically binding it to the localhost interface. This prevents external access.
 
--v $(pwd)/memory:/app/memory: Mounts your local memory directory into the container. Place your memory dump files here.
+-v "$(pwd)"/memory:/app/memory: Mounts your local memory directory into the container. Place your memory dump files here.
 
--v $(pwd)/out:/app/out: Mounts your local out directory into the container. Analysis results and reports will be saved here.
+-v "$(pwd)"/out:/app/out: Mounts your local out directory into the container. Analysis results and reports will be saved here.
 
 --rm: Automatically removes the container once it exits.
 
@@ -151,21 +113,23 @@ Configure Analysis: In the UI, enter a Project Name and the Memory File Name (e.
 
 API Keys (Optional):
 
-AbuseIPDB API Key (for IP Enrichment): Provide an API key from AbuseIPDB for IP geo-location and reputation analysis.
+AbuseIPDB API Key: Provide an API key from AbuseIPDB for IP geo-location and reputation analysis.
 
 Gemini API Key: Provide your Gemini API key to enable AI-generated summaries and verdicts.
 
-Launch Analysis: Click "Launch Analysis" to start the automated forensic scan.
+Launch Analysis: Click Launch Analysis to start the automated forensic scan.
 
-Review Results: Once the scan is complete, explore the "Report Summary", "Findings", and "Artifacts" tabs for detailed insights and AI narratives. You can also review the Detections and Baseline rules via the links in the top navigation bar.
+Review Results: Once the scan is complete, explore the "Report Summary", "Findings", and "Artifacts" tabs for detailed insights and AI narratives.
 
 Output & Reporting
-All generated analysis reports, detailed findings (JSONL), AI verdicts (JSON), and raw artifact files from Volatility plugins will be saved in the out/<PROJECT_NAME>/ directory on your host machine. This allows for offline review and integration with other tools.
+All generated analysis reports, detailed findings (JSONL), and raw artifact files from Volatility plugins will be saved in the out/<PROJECT_NAME>/ directory on your host machine. This allows for offline review and integration with other tools.
+
+License
+DeepProbe is a wrapper built on the Volatility 3 Framework, and as such, it is licensed under the Volatility Software License (VSL), Version 1.0.
+
+The VSL is a copyleft license that requires any additions or wrappers built on the Volatility Framework to also be made publicly available under the same license. This ensures the project remains open and accessible to all.
+
+A full copy of the license is available in the LICENSE file in this repository.
 
 Contributing
 We welcome contributions from the community! If you'd like to improve DeepProbe, please refer to our CONTRIBUTING.md (coming soon!) for guidelines on how to report bugs, suggest features, and submit pull requests.
-
-License
-This project is licensed under the MIT License - see the 
-
-LICENSE file for details
