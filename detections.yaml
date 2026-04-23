@@ -176,10 +176,6 @@ os_profiles:
             match: [{ field: country, value: "CN" }]
           - rule_id: suspicious_location_kp
             match: [{ field: country, value: "KP" }]
-          - rule_id: suspicious_location_fr
-            match: [{ field: country, value: "FR" }]
-          - rule_id: suspicious_location_be
-            match: [{ field: country, value: "BE" }]
           - rule_id: suspicious_location_ir
             match: [{ field: country, value: "IR" }]
           - rule_id: suspicious_location_cu
@@ -589,6 +585,212 @@ os_profiles:
         params:
           any_name_contains: ["dumpit.exe","winpmem","ramcapture","fmem"]
 
+      # --- NEW Windows Detection Rules ---
+      - id: exec_from_tmp
+        title: Process executing from temporary/user-writable directory
+        narrative: "A process is running from a temporary or user-writable directory (e.g. %TEMP%, %APPDATA%, Downloads). Legitimate applications rarely execute from these paths. This is a very common staging technique used by malware after initial delivery."
+        mitre: ["T1204", "T1036.005"]
+        weight: 10
+        engine: exec_from_tmp
+        enabled: true
+        evidence_fields: ["pid", "name", "path"]
+        params:
+          temp_like_paths:
+            - "\\\\temp\\\\"
+            - "\\\\appdata\\\\"
+            - "\\\\users\\\\[^\\\\]+\\\\downloads\\\\"
+            - "\\\\programdata\\\\.*\\\\temp"
+            - "\\\\windows\\\\temp"
+            - "\\\\public\\\\"
+
+      - id: lsass_credential_dump
+        title: LSASS credential dump tool or pattern detected
+        narrative: "A command line or injected memory region matches known credential dumping tools or patterns targeting LSASS. This strongly indicates an attacker is attempting to harvest credentials for lateral movement or privilege escalation."
+        mitre: ["T1003.001", "T1059"]
+        weight: 15
+        engine: lsass_credential_dump
+        enabled: true
+        evidence_fields: ["pid", "name", "command_line", "Notes"]
+
+      - id: entropy_anomaly
+        title: High-entropy executable memory (packed shellcode)
+        narrative: "Private memory regions with executable permissions show abnormally high Shannon entropy, strongly suggesting packed, encrypted, or obfuscated shellcode. Legitimate code typically has much lower entropy."
+        mitre: ["T1055", "T1027"]
+        weight: 10
+        engine: entropy_anomaly
+        enabled: true
+        evidence_fields: ["pid", "process", "Start", "End", "Protection", "Entropy", "Notes"]
+        params:
+          threshold: 7.0
+
+      # ── Modern Attack Technique Detections ────────────────────────────────
+
+      - id: amsi_bypass
+        title: AMSI bypass attempt detected
+        narrative: "A process is attempting to disable or patch the Anti-Malware Scan Interface (AMSI), which would blind security products from inspecting PowerShell and script execution. This is a critical prerequisite step for running malicious scripts undetected, commonly seen in fileless malware and advanced adversary toolkits."
+        mitre: ["T1562.001", "T1027", "T1059.001"]
+        weight: 10
+        engine: amsi_bypass
+        enabled: true
+        evidence_fields: ["pid", "name", "command_line", "pattern", "Notes"]
+
+      - id: etw_patching
+        title: ETW or audit-log disablement detected
+        narrative: "Event Tracing for Windows (ETW) or Windows Event Log service is being patched, cleared, or disabled. Attackers do this to blind detection tools and remove forensic evidence of their activity. Clearing event logs before or during an attack is a well-known defense evasion technique."
+        mitre: ["T1562.001", "T1070.001", "T1070.002"]
+        weight: 8
+        engine: etw_patching
+        enabled: true
+        evidence_fields: ["pid", "name", "command_line", "pattern", "Notes"]
+
+      - id: token_impersonation
+        title: Token impersonation / privilege theft detected
+        narrative: "A non-system process is holding a Token handle with impersonation or duplication rights. Token impersonation allows an attacker to execute code under a different user's identity — typically SYSTEM or a domain admin — without knowing their credentials. This is a key privilege escalation technique."
+        mitre: ["T1134", "T1134.001", "T1134.002"]
+        weight: 10
+        engine: token_impersonation
+        enabled: true
+        evidence_fields: ["pid", "name", "access_mask", "Notes"]
+
+      - id: lateral_movement_ports
+        title: Lateral movement network activity (SMB/WinRM/RPC)
+        narrative: "A non-system process is making outbound connections on ports commonly used for lateral movement: SMB (445), WinRM (5985/5986), or DCOM/RPC (135). These are the same protocols abused by PsExec, WMI remote execution, and 'Pass-the-Hash' attacks to spread through the network."
+        mitre: ["T1021.002", "T1021.006", "T1021.003", "T1550.002"]
+        weight: 8
+        engine: lateral_movement_ports
+        enabled: true
+        evidence_fields: ["pid", "name", "ForeignAddr", "ForeignPort", "State", "Notes"]
+
+      - id: wmi_suspicious_spawn
+        title: WMI or MMC spawning suspicious child process
+        narrative: "WmiPrvSE.exe (Windows WMI Provider) or mmc.exe is spawning command shells, script interpreters, or utility binaries. This is a hallmark of remote WMI execution (wmic /node:, Invoke-WmiMethod) — an attacker's common method for lateral movement and remote code execution that bypasses many endpoint controls."
+        mitre: ["T1047", "T1059", "T1218"]
+        weight: 8
+        engine: wmi_suspicious_spawn
+        enabled: true
+        evidence_fields: ["pid", "name", "parent_pid", "parent_name", "Notes"]
+
+      - id: lolbin_enhanced
+        title: Living-off-the-Land binary abuse (targeted patterns)
+        narrative: "A signed Windows binary is being used in a way consistent with known attack techniques: certutil as a download tool, mshta loading remote HTML applications, rundll32 running JavaScript, regsvr32 loading remote scriptlets (Squiblydoo), or msiexec installing remote packages. These patterns go far beyond normal administrative use."
+        mitre: ["T1218.001", "T1218.003", "T1218.005", "T1218.007", "T1218.010", "T1218.011", "T1105", "T1047"]
+        weight: 8
+        engine: lolbin_enhanced
+        enabled: true
+        evidence_fields: ["pid", "name", "command_line", "lolbin", "Notes"]
+
+      - id: archive_staging
+        title: Archive file staged in suspicious location (pre-exfiltration)
+        narrative: "Archive files (zip, rar, 7z, tar) were found in temporary directories, the user's Desktop, or Downloads folder. Attackers commonly compress and archive sensitive data immediately before exfiltrating it. The presence of unexpected archives in these locations — especially alongside outbound connections — is a strong exfiltration indicator."
+        mitre: ["T1560.001", "T1074.001"]
+        weight: 5
+        engine: archive_staging
+        enabled: true
+        evidence_fields: ["Offset", "Path", "Notes"]
+
+      - id: exfil_connections
+        title: Suspicious high-volume outbound connections (data exfiltration)
+        narrative: "A non-browser process has five or more simultaneous established outbound connections to external IP addresses. Legitimate applications rarely maintain this many concurrent external connections. This pattern is consistent with data exfiltration via multiple upload streams or a C2 beacon maintaining redundant connections."
+        mitre: ["T1041", "T1048", "T1071.001"]
+        weight: 7
+        engine: exfil_connections
+        enabled: true
+        evidence_fields: ["pid", "name", "connection_count", "unique_ips", "sample_ips", "Notes"]
+
+      # ── New Correlation Rules (Modern Techniques) ──────────────────────────
+
+      - id: correlation_evasion_priv_esc
+        title: High-Confidence Threat (Evasion + Privilege Escalation)
+        narrative: "This is a severe finding. Security tool blinding (AMSI bypass or ETW patching) is combined with privilege escalation indicators (token impersonation or process injection). The attacker is simultaneously disabling detection and gaining elevated privileges — a pattern consistent with advanced ransomware and APT post-exploitation toolkits."
+        mitre: ["T1562.001", "T1134", "T1027", "T1055"]
+        weight: 15
+        engine: correlated_findings
+        enabled: true
+        evidence_fields: ["correlated_finding_ids"]
+        params:
+          correlation_pairs:
+            - primary_ids: ["amsi_bypass", "etw_patching"]
+              secondary_ids: ["token_impersonation", "malfind_injection", "handles_lsass_access"]
+
+      - id: correlation_lolbin_chain
+        title: High-Confidence Threat (LOLBin Execution Chain)
+        narrative: "LOLBin abuse is chained with persistence or network activity. A trusted Windows binary is being weaponized for execution, followed by persistence mechanisms or C2 communication. This multi-stage pattern is characteristic of fileless malware and living-off-the-land attacks that deliberately avoid touching disk with malicious files."
+        mitre: ["T1218", "T1071", "T1547.001", "T1053"]
+        weight: 15
+        engine: correlated_findings
+        enabled: true
+        evidence_fields: ["correlated_finding_ids"]
+        params:
+          correlation_pairs:
+            - primary_ids: ["lolbin_enhanced", "wmi_suspicious_spawn"]
+              secondary_ids: ["suspicious_connection", "netscan_beacon_like", "registry_run_key_persistence", "scheduled_tasks_suspicious"]
+
+      - id: correlation_exfil_chain
+        title: High-Confidence Threat (Data Staging + Exfiltration)
+        narrative: "Archive creation is correlated with high-volume outbound connections or suspicious network activity. This chain — compress data then upload — is a textbook data theft pattern. The combination strongly suggests an attacker is actively exfiltrating collected data to external infrastructure."
+        mitre: ["T1560.001", "T1041", "T1048", "T1074"]
+        weight: 15
+        engine: correlated_findings
+        enabled: true
+        evidence_fields: ["correlated_finding_ids"]
+        params:
+          correlation_pairs:
+            - primary_ids: ["archive_staging"]
+              secondary_ids: ["exfil_connections", "suspicious_connection", "suspicious_network_enrichment"]
+
+      # --- NEW Correlation Rules ---
+      - id: correlation_lateral_movement
+        title: High-Confidence Threat (Lateral Movement Indicators)
+        narrative: "Multiple indicators suggest active lateral movement. Suspicious network connections combined with credential access or unusual process relationships strongly suggest the attacker is pivoting through the network."
+        mitre: ["T1021", "T1078", "T1550"]
+        weight: 15
+        engine: correlated_findings
+        enabled: true
+        evidence_fields: ["correlated_finding_ids"]
+        params:
+          correlation_pairs:
+            - primary_ids: ["handles_lsass_access", "lsass_credential_dump", "malfind_injection"]
+              secondary_ids: ["suspicious_connection", "suspicious_network_enrichment", "netscan_beacon_like"]
+
+      - id: correlation_credential_dumping
+        title: High-Confidence Threat (Credential Dumping Chain)
+        narrative: "This is a critical finding. Evidence shows a coordinated credential theft attack: a tool or injected code is targeting LSASS memory, combined with process injection or file-based staging. The attacker is likely harvesting credentials to escalate privileges or move laterally."
+        mitre: ["T1003.001", "T1055", "T1105"]
+        weight: 15
+        engine: correlated_findings
+        enabled: true
+        evidence_fields: ["correlated_finding_ids"]
+        params:
+          correlation_pairs:
+            - primary_ids: ["lsass_credential_dump", "handles_lsass_access"]
+              secondary_ids: ["malfind_injection", "exec_from_tmp", "filescan_suspicious_names", "entropy_anomaly"]
+
+      - id: correlation_defense_evasion
+        title: High-Confidence Threat (Defense Evasion Chain)
+        narrative: "Multiple defense evasion techniques are being used simultaneously. Hidden processes, unlinked modules, and high-entropy memory together indicate a sophisticated attacker actively working to avoid detection while maintaining access."
+        mitre: ["T1014", "T1027", "T1055", "T1036"]
+        weight: 15
+        engine: correlated_findings
+        enabled: true
+        evidence_fields: ["correlated_finding_ids"]
+        params:
+          correlation_pairs:
+            - primary_ids: ["psxview_hidden", "ldr_unlinked_module", "entropy_anomaly"]
+              secondary_ids: ["verinfo_mismatch", "exec_from_tmp", "unusual_parent_child", "malfind_injection"]
+
+      - id: correlation_discovery
+        title: High-Confidence Threat (Active Discovery + Staging)
+        narrative: "A process is exhibiting discovery behavior combined with staging artifacts. Suspicious command lines performing enumeration (whoami, ipconfig, net) alongside files staged in temporary locations suggest an attacker is actively mapping the environment before their next move."
+        mitre: ["T1082", "T1057", "T1105", "T1059"]
+        weight: 15
+        engine: correlated_findings
+        enabled: true
+        evidence_fields: ["correlated_finding_ids"]
+        params:
+          correlation_pairs:
+            - primary_ids: ["suspicious_cmdline_args", "userassist_suspicious"]
+              secondary_ids: ["exec_from_tmp", "filescan_suspicious_names", "registry_run_key_persistence", "scheduled_tasks_suspicious"]
+
   linux:
     plugins:
       - { name: "linux.pslist",          format: "csv"  }
@@ -649,10 +851,7 @@ os_profiles:
             match: [{ field: country, value: "CN" }]
           - rule_id: suspicious_location_kp
             match: [{ field: country, value: "KP" }]
-          - rule_id: suspicious_location_fr
-            match: [{ field: country, value: "FR" }]
-          - rule_id: suspicious_location_be
-            match: [{ field: country, value: "BE" }]
+          # FR and BE removed — NATO allies, generates excessive false positives
           - rule_id: suspicious_location_ir
             match: [{ field: country, value: "IR" }]
           - rule_id: suspicious_location_cu
@@ -769,6 +968,38 @@ os_profiles:
             - "msfvenom"
             - "/dev/tcp/"
 
+      # --- NEW Linux Detection Rules ---
+      - id: linux_ldpreload
+        title: LD_PRELOAD / LD_LIBRARY_PATH hijacking detected
+        narrative: "A process has LD_PRELOAD or LD_LIBRARY_PATH set in its environment, which forces custom shared libraries to load before system libraries. Attackers use this to intercept system calls, hook functions, or inject malicious code into legitimate processes without modifying them on disk."
+        mitre: ["T1574.006"]
+        weight: 10
+        engine: linux_ldpreload
+        enabled: true
+        evidence_fields: ["pid", "process", "Variable", "Value", "Notes"]
+
+      - id: linux_cron_persistence
+        title: Cron/at-based persistence indicators
+        narrative: "Commands in bash history or open file handles point to cron or at-job manipulation. Attackers commonly abuse cron to ensure their malicious code re-executes after reboots or on a schedule, maintaining persistent access to the system."
+        mitre: ["T1053.003"]
+        weight: 8
+        engine: linux_cron_persistence
+        enabled: true
+        evidence_fields: ["source", "Command", "Notes"]
+
+      - id: correlation_linux_evasion_network
+        title: High-Confidence Linux Threat (Evasion + Network)
+        narrative: "Hidden processes or library hijacking combined with suspicious network connections strongly indicate an active Linux compromise. The attacker is hiding their presence while maintaining command and control communication."
+        mitre: ["T1055", "T1071", "T1574.006"]
+        weight: 15
+        engine: correlated_findings
+        enabled: true
+        evidence_fields: ["correlated_finding_ids"]
+        params:
+          correlation_pairs:
+            - primary_ids: ["linux_hidden_process", "linux_ldpreload", "linux_unsigned_module"]
+              secondary_ids: ["suspicious_connection", "suspicious_network_enrichment", "suspicious_port_activity"]
+
   macos:
     plugins:
       - { name: "mac.pslist",        format: "csv"  }
@@ -822,10 +1053,7 @@ os_profiles:
             match: [{ field: country, value: "CN" }]
           - rule_id: suspicious_location_kp
             match: [{ field: country, value: "KP" }]
-          - rule_id: suspicious_location_fr
-            match: [{ field: country, value: "FR" }]
-          - rule_id: suspicious_location_be
-            match: [{ field: country, value: "BE" }]
+          # FR and BE removed — NATO allies, generates excessive false positives
           - rule_id: suspicious_location_ir
             match: [{ field: country, value: "IR" }]
           - rule_id: suspicious_location_cu

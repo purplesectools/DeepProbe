@@ -1,0 +1,84 @@
+# DeepProbe — self-contained docker-compose
+# Starts two services on an isolated internal network:
+#   ollama    — local LLM inference server (no data leaves your machine)
+#   deepprobe — the Streamlit forensics UI
+#
+# Usage:
+#   docker compose up --build          # first run (downloads Ollama image + builds DeepProbe)
+#   docker compose up                  # subsequent runs
+#   docker compose down                # stop everything
+#   docker compose down -v             # stop and delete the model cache volume
+
+services:
+
+  # ─────────────────────────────────────────────
+  # Ollama — local LLM server
+  # ─────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: deepprobe-ollama
+    networks:
+      - deepprobe-net
+    volumes:
+      - ollama_models:/root/.ollama   # persists downloaded models across restarts
+    ports:
+      - "127.0.0.1:11434:11434"       # localhost only — not exposed on the network
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h         # keep model loaded in RAM between requests
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12          # up to 2 minutes for first start
+      start_period: 15s
+    restart: unless-stopped
+
+    # ── GPU support (optional) ──────────────────
+    # Mac Apple Silicon: Metal is used automatically — no extra config needed.
+    #
+    # Linux with NVIDIA GPU — uncomment the block below:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # ─────────────────────────────────────────────
+  # DeepProbe — Streamlit forensics UI
+  # ─────────────────────────────────────────────
+  deepprobe:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: deepprobe-app
+    depends_on:
+      ollama:
+        condition: service_healthy   # wait until Ollama is fully up
+    networks:
+      - deepprobe-net
+    ports:
+      - "127.0.0.1:8501:8501"        # localhost only
+    volumes:
+      - ./memory:/app/memory         # place memory dumps here on your host
+      - ./out:/app/out               # analysis results saved here on your host
+    environment:
+      - OLLAMA_HOST=http://ollama:11434   # internal service name, not localhost
+      - DEFAULT_MODEL=llama3.2:3b        # pulled automatically on first Ask AI click
+    restart: unless-stopped
+
+# ─────────────────────────────────────────────
+# Shared network — services talk to each other
+# but are isolated from the outside
+# ─────────────────────────────────────────────
+networks:
+  deepprobe-net:
+    driver: bridge
+
+# ─────────────────────────────────────────────
+# Named volume — model files survive container restarts
+# Remove with: docker compose down -v
+# ─────────────────────────────────────────────
+volumes:
+  ollama_models:

@@ -4,6 +4,8 @@ import sys
 import time
 import re
 import base64
+import math
+import requests
 from pathlib import Path
 import os
 import json
@@ -11,6 +13,7 @@ import yaml
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import plotly.express as px
 from streamlit.components.v1 import html
 from datetime import datetime
 
@@ -21,6 +24,377 @@ MEMORY_FOLDER = BASE_DIR / "memory"
 OUTPUT_FOLDER = BASE_DIR / "out" # Base output directory
 BASELINE_FILE_PATH = BASE_DIR / "baseline.yaml"
 DETECTIONS_FILE_PATH = BASE_DIR / "detections.yaml"
+
+# Ollama — reads from env var set by docker-compose; falls back to localhost for dev
+def _resolve_ollama_host() -> str:
+    """
+    Pick the right Ollama base URL depending on where the app is running.
+
+    Priority:
+      1. OLLAMA_HOST env var (set by docker-compose to http://ollama:11434) — always wins.
+      2. If we're inside a Docker container (/.dockerenv exists) and no explicit var was
+         given, reach the host machine via the special DNS name `host.docker.internal`.
+         This covers the case where someone runs the DeepProbe container standalone
+         while Ollama is running on the host.
+      3. Plain localhost — for native / dev runs outside Docker.
+    """
+    explicit = os.environ.get("OLLAMA_HOST", "")
+    if explicit:
+        return explicit
+    if Path("/.dockerenv").exists():
+        return "http://host.docker.internal:11434"
+    return "http://localhost:11434"
+
+OLLAMA_HOST = _resolve_ollama_host()
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "llama3.2:3b")
+
+RECOMMENDED_MODELS = [
+    "llama3.2:3b",    # 2 GB  — fast, works on any machine
+    "llama3.1:8b",    # 5 GB  — better reasoning
+    "mistral:7b",     # 4 GB  — excellent instruction following
+    "phi3:mini",      # 2.3 GB — lightest option
+    "gemma2:2b",      # 1.6 GB — Google Gemma, very lightweight
+]
+
+# set_page_config MUST be the first Streamlit command executed.
+# It lives here at module scope so it runs before any other st.* call
+# (including the CSS st.markdown block below).
+st.set_page_config(
+    page_title="DeepProbe | Memory Forensics",
+    page_icon="🕵️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# ---------------------------------------------------------------------------
+# Ollama helper functions
+# ---------------------------------------------------------------------------
+
+def check_ollama_health() -> bool:
+    """Return True if the Ollama service is reachable."""
+    try:
+        r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=3)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def get_ollama_models() -> list:
+    """Return list of model names already pulled in Ollama."""
+    try:
+        r = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=3)
+        if r.status_code == 200:
+            return [m["name"] for m in r.json().get("models", [])]
+    except Exception:
+        pass
+    return []
+
+
+def pull_ollama_model(model_name: str) -> tuple:
+    """
+    Pull a model from the Ollama library.
+    Returns (success: bool, message: str).
+    Uses stream=False so the whole pull happens in one request (up to 10 min).
+    """
+    try:
+        r = requests.post(
+            f"{OLLAMA_HOST}/api/pull",
+            json={"name": model_name, "stream": False},
+            timeout=600,
+        )
+        if r.status_code == 200:
+            return True, f"Model `{model_name}` downloaded successfully."
+        return False, f"Pull failed — HTTP {r.status_code}: {r.text[:200]}"
+    except requests.exceptions.Timeout:
+        return False, "Pull timed out (>10 min). Try a smaller model or check your connection."
+    except Exception as e:
+        return False, f"Pull error: {e}"
+
+
+def query_ollama(model: str, prompt: str) -> str:
+    """Send a prompt to Ollama and return the response text.
+
+    Determinism settings:
+      temperature=0  → greedy decoding, no randomness.
+      seed=42        → reproducible outputs across identical prompts.
+      top_p=1.0      → disable nucleus sampling (irrelevant at temp=0 but explicit).
+    These settings prevent hallucinations by making the model output the single
+    most probable token at every step instead of sampling randomly.
+    """
+    try:
+        r = requests.post(
+            f"{OLLAMA_HOST}/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0,
+                    "seed": 42,
+                    "top_p": 1.0,
+                    "num_predict": 512,   # cap token budget — forensic summaries don't need to be long
+                },
+            },
+            timeout=120,
+        )
+        r.raise_for_status()
+        return r.json().get("response", "No response returned by model.")
+    except requests.exceptions.ConnectionError:
+        return "⚠️ Cannot reach Ollama service. Is it running? Check the sidebar status."
+    except requests.exceptions.Timeout:
+        return "⚠️ Ollama took too long to respond. Try a smaller/faster model."
+    except requests.exceptions.HTTPError as e:
+        # Try to get the real reason from Ollama's JSON body
+        body_msg = ""
+        if e.response is not None:
+            try:
+                body_msg = e.response.json().get("error", "")
+            except Exception:
+                body_msg = e.response.text or ""
+            if e.response.status_code == 404 or (
+                "not found" in body_msg.lower() or "pull" in body_msg.lower()
+            ):
+                return (
+                    f"⚠️ Model **{model}** is not downloaded yet. "
+                    "Open the sidebar, select the model and click '⬇️ Download' to pull it first."
+                )
+        return f"⚠️ Ollama returned an error ({e.response.status_code if e.response else '?'}): {body_msg or str(e)}"
+    except Exception as e:
+        return f"⚠️ Ollama error: {e}"
+
+
+def _clean_evidence_for_llm(raw_evidence: list, max_items: int = 3) -> list:
+    """
+    Filter and sanitise evidence items before sending to an LLM.
+    Removes:
+      - Volatility internal messages (warnings, library path lines, progress output)
+      - Items that are plain strings containing no useful forensic data
+      - Keys whose values are empty, None, or noise strings
+    Returns a list of clean dicts with at most max_items entries.
+    """
+    _NOISE_PATTERNS = re.compile(
+        r"(^WARNING|^ERROR|^INFO|Traceback|\.pyc|site-packages|volatility3|"
+        r"^\s*$|Progress:|Stacking attempts|incompatible:|PluginRequirements)",
+        re.IGNORECASE,
+    )
+    _NOISE_VALUES = {"", "None", "N/A", "nan", "0", "0.0", "-", "—"}
+
+    cleaned = []
+    for item in raw_evidence:
+        if not isinstance(item, dict):
+            # Skip raw string lines (Volatility console output)
+            continue
+        filtered = {
+            k: v for k, v in item.items()
+            if str(v).strip() not in _NOISE_VALUES
+            and not _NOISE_PATTERNS.search(str(v))
+        }
+        if filtered:
+            cleaned.append(filtered)
+        if len(cleaned) >= max_items:
+            break
+    return cleaned
+
+
+def query_llm(finding: dict, model: str = DEFAULT_MODEL, gemini_key: str = "") -> str:
+    """
+    Unified LLM call for individual (non-correlated) findings.
+    Evidence is pre-filtered through _clean_evidence_for_llm() before the prompt is built.
+    The prompt enforces strict evidence-bound output with no hallucination, no unsafe
+    remediation advice, and no MITRE IDs embedded inline in explanation text.
+    """
+    title  = finding.get('title', 'Unknown Finding')
+    weight = finding.get('weight', 0)
+    # MITRE IDs provided as reference metadata only — not for inline embedding
+    mitre_ref = ', '.join(finding.get('mitre', [])) or 'None provided'
+
+    clean_ev = _clean_evidence_for_llm(finding.get("evidence", []), max_items=3)
+    evidence_sample = (
+        json.dumps(clean_ev, indent=2, ensure_ascii=False)
+        if clean_ev else "(no structured evidence available)"
+    )
+
+    prompt = (
+        "You are a memory forensics analyst reviewing a single finding from an automated scan.\n\n"
+        "HARD CONSTRAINTS — non-negotiable rules for your response:\n"
+        "1. Use ONLY the finding title and evidence fields provided below. "
+        "   Do NOT generate or infer file paths, process names, IP addresses, PIDs, "
+        "   module names, registry keys, or memory values not present in the evidence.\n"
+        "2. Do NOT mention lateral movement, credential theft, persistence, C2 communication, "
+        "   privilege escalation, or any attack technique UNLESS the finding title or evidence "
+        "   explicitly names it.\n"
+        "3. Do NOT embed MITRE technique IDs inline in your explanation. "
+        "   MITRE tags are provided as reference metadata only — do not quote them in body text.\n"
+        "4. Avoid hedging language: do NOT write 'may be used', 'could indicate', "
+        "   'might suggest', 'possibly', or 'likely' unless the evidence explicitly limits certainty. "
+        "   State what the evidence shows directly, or omit the claim.\n"
+        "5. Remediation — ONLY use these safe forms: "
+        "   'isolate the system', 'investigate affected processes', 'collect memory artifacts', "
+        "   'preserve the memory image', 'escalate to the IR team'. "
+        "   NEVER recommend killing, terminating, or stopping a specific process by name.\n"
+        "6. If the evidence is insufficient to support a statement, say so explicitly.\n\n"
+        f"Finding: {title}\n"
+        f"Severity Score: {weight} / 15\n"
+        f"MITRE reference (metadata only, do not quote inline): {mitre_ref}\n"
+        f"Evidence (filtered, up to 3 items):\n{evidence_sample}\n\n"
+        "Respond with exactly three short paragraphs:\n"
+        "**What this means:** Summarise what the evidence shows — state facts, not assumptions.\n"
+        "**Why it is dangerous:** Describe the confirmed risk based only on the evidence provided.\n"
+        "**Immediate actions:** List 2-3 steps using only the safe remediation forms above."
+    )
+
+    if gemini_key:
+        return query_gemini(gemini_key, {
+            **finding,
+            "evidence": clean_ev,
+            "_prompt_override": prompt,
+        })
+    return query_ollama(model, prompt)
+
+
+def query_llm_correlated(finding: dict, model: str = DEFAULT_MODEL, gemini_key: str = "") -> str:
+    """
+    LLM call specifically for correlated / system-wide findings.
+    Builds a chain-aware prompt from correlated_chains. Evidence items are
+    pre-filtered through _clean_evidence_for_llm() to remove Volatility noise
+    before any values reach the model.
+    """
+    fid    = finding.get("id", "")
+    title  = finding.get("title", "Correlated Threat")
+    # Use MITRE IDs exactly as provided — never remap or reinterpret
+    mitre  = ", ".join(finding.get("mitre", [])) or "None provided"
+    chains = finding.get("correlated_chains", [])
+
+    # ------------------------------------------------------------------
+    # Build sanitised chain text — only clean forensic signals reach LLM
+    # ------------------------------------------------------------------
+    chain_lines: list = []
+    for item in chains:
+        pid       = item.get("correlated_pid", "?")
+        corr_type = item.get("correlation_type", "")
+        layers    = item.get("layers_involved", [])
+
+        sub_findings = item.get("correlated_findings", [])
+        for sf in sub_findings[:8]:
+            layer_tag = f"[{sf.get('layer', corr_type or 'unknown').upper()}] " if sf.get("layer") else ""
+            role_tag  = f" ({sf.get('process_role', '')})" if sf.get("process_role") else ""
+
+            # Clean the evidence sample — removes Volatility warnings, library paths, etc.
+            raw_ev = sf.get("evidence", [])
+            clean  = _clean_evidence_for_llm(raw_ev, max_items=1)
+            if clean:
+                # Only include key-value pairs where the value is ≤60 chars (avoids memory blobs)
+                ev_parts = [
+                    f"{k}: {str(v)[:60]}"
+                    for k, v in list(clean[0].items())[:4]
+                    if str(v).strip() not in ("", "None", "N/A", "nan")
+                    and len(str(v)) <= 200            # skip raw hex / base64 blobs
+                    and not str(v).startswith("0x")  # skip memory addresses
+                ]
+                ev_txt = ", ".join(ev_parts)
+            else:
+                ev_txt = ""
+
+            chain_lines.append(
+                f"  • {layer_tag}{sf.get('title', sf.get('finding_id', '?'))}{role_tag}"
+                + (f"  [evidence: {ev_txt}]" if ev_txt else "")
+            )
+
+    chain_text = "\n".join(chain_lines) or "  (no individual findings listed)"
+
+    # ------------------------------------------------------------------
+    # Hard constraint block — injected into every correlated prompt
+    # ------------------------------------------------------------------
+    _HARD_CONSTRAINTS = (
+        "HARD CONSTRAINTS — non-negotiable rules for your response:\n"
+        "1. Use ONLY the finding names and evidence fields explicitly listed below. "
+        "   Do NOT generate, infer, or assume file paths, process names, PIDs, "
+        "   memory addresses, module names, or registry keys not present in the data.\n"
+        "2. Do NOT mention lateral movement, credential theft, persistence, C2 communication, "
+        "   privilege escalation, or any attack technique UNLESS a finding in the list below "
+        "   explicitly names it. Do not add attack claims beyond what the findings state.\n"
+        "3. Do NOT embed MITRE technique IDs inline in your explanation. "
+        "   MITRE tags are provided as reference metadata — do not quote them in body text.\n"
+        "4. Avoid hedging language: do NOT write 'may be used', 'could indicate', "
+        "   'might suggest', 'possibly', or 'likely' unless the evidence explicitly limits certainty. "
+        "   State what the evidence shows directly, or omit the claim entirely.\n"
+        "5. Remediation — ONLY use these safe forms: "
+        "   'isolate the system', 'investigate affected processes', 'collect memory artifacts', "
+        "   'preserve the memory image', 'escalate to the IR team'. "
+        "   NEVER name a specific process to kill, terminate, or stop.\n"
+        "6. Use 'analysis indicates' or 'evidence shows' — not 'the attacker did'.\n"
+        "7. If the evidence is insufficient to support a statement, say so explicitly "
+        "   rather than filling the gap with plausible-sounding detail.\n\n"
+    )
+
+    # System-wide compromise
+    if fid == "correlation_system_wide":
+        all_layers = sorted({
+            layer
+            for item in chains
+            for layer in item.get("layers_involved", [])
+        })
+        prompt = (
+            "You are a memory forensics analyst producing an evidence-bound summary "
+            "of a system-wide compromise for an incident response team.\n\n"
+            + _HARD_CONSTRAINTS +
+            f"Confirmed forensic layers ({len(all_layers)} simultaneously active): "
+            f"{', '.join(all_layers) or 'multiple layers'}\n"
+            f"MITRE reference (metadata only, do not quote inline): {mitre}\n\n"
+            f"Findings present in this memory image:\n{chain_text}\n\n"
+            "Respond with exactly three sections:\n\n"
+            "**What this means:** Summarise what each listed finding shows. "
+            "State only what the evidence above directly supports. "
+            "Do not infer a sequence of events, initial access method, or attacker motivation.\n\n"
+            "**Why it is dangerous:** Describe the confirmed risk of having high-severity "
+            "indicators across multiple forensic layers simultaneously. "
+            "Base every statement on a specific finding from the list above — "
+            "do not extrapolate or add attack claims not present in the findings.\n\n"
+            "**Immediate actions:** List exactly 3 steps. "
+            "Use only these forms: 'isolate the system', 'investigate affected processes', "
+            "'collect memory artifacts', 'preserve the memory image', 'escalate to the IR team'. "
+            "Do not name a specific process to terminate or stop."
+        )
+    else:
+        # Pair-based correlated finding
+        confidence = chains[0].get("confidence", "") if chains else ""
+        conf_scope = {
+            "strong": "within the same process (PID-level match)",
+            "medium": "across a parent-child process pair",
+            "weak":   "as co-present behavioral indicators in the same image",
+        }.get(confidence, "across multiple correlated findings")
+
+        prompt = (
+            f"You are a memory forensics analyst reviewing a correlated finding.\n"
+            f"Correlation: {title}\n"
+            f"Scope: {conf_scope}\n\n"
+            + _HARD_CONSTRAINTS +
+            f"MITRE reference (metadata only, do not quote inline): {mitre}\n\n"
+            f"Findings present in this memory image:\n{chain_text}\n\n"
+            "Respond with exactly three sections:\n\n"
+            "**What this means:** Describe what the correlated evidence shows — "
+            "which findings are linked, how they relate, and what the combination confirms. "
+            "State only what the listed findings directly support. "
+            "Do not add attack claims beyond what the findings name.\n\n"
+            "**Why it is dangerous:** Explain the confirmed risk this correlation represents "
+            "and why it is more severe than any single finding alone. "
+            "Every statement must be grounded in a specific finding from the list above.\n\n"
+            "**Immediate actions:** List 2-3 steps. "
+            "Use only these forms: 'isolate the system', 'investigate affected processes', "
+            "'collect memory artifacts', 'preserve the memory image', 'escalate to the IR team'. "
+            "Do not name a specific process to terminate or stop."
+        )
+
+    if gemini_key:
+        return query_gemini(gemini_key, {
+            "title":    title,
+            "mitre":    finding.get("mitre", []),
+            "weight":   finding.get("weight", 0),
+            "evidence": [],
+            "_prompt_override": prompt,
+        })
+    return query_ollama(model, prompt)
 
 
 # Ensure necessary directories exist at startup.
@@ -202,9 +576,20 @@ def run_analysis_and_show_progress(case_name, memory_file_path, ip_enrichment_ap
 
     TOTAL_STEPS = 20
     current_step = 0
-    status_text.info("Preparing analysis environment...")
-    
-    # New, more robust loop for reading process output
+    status_text.info("Preparing analysis environment…")
+
+    completed_plugins = []
+    checklist_placeholder = st.empty()
+
+    def _render_checklist(done_list, current_msg=""):
+        lines = []
+        for p in done_list[-12:]:          # show last 12 to avoid overflow
+            lines.append(f"✅ `{p}`")
+        if current_msg:
+            lines.append(f"⟳ *{current_msg}*")
+        checklist_placeholder.markdown("\n\n".join(lines))
+
+    # Robust loop reading subprocess output line-by-line
     while True:
         line = process.stdout.readline()
         if not line and process.poll() is not None:
@@ -217,14 +602,25 @@ def run_analysis_and_show_progress(case_name, memory_file_path, ip_enrichment_ap
                     plugin_name = line.split(":", 1)[1].strip().split(" ")[0]
                     friendly_name = get_friendly_scan_name(plugin_name)
                     status_text.info(friendly_name)
+                    if completed_plugins:
+                        completed_plugins[-1] = completed_plugins[-1]   # keep prev
+                    # mark the previous as done and show the current as in-progress
+                    _render_checklist(completed_plugins, friendly_name)
+                    completed_plugins.append(friendly_name)
                 except IndexError:
-                # Catch cases where the line format is not as expected
                     pass
                 progress_fraction = min(1.0, current_step / TOTAL_STEPS)
-                progress_percent = int(progress_fraction * 100)
-                progress_bar.progress(progress_fraction, text=f"{progress_percent}% Complete")
-            if "[i] Running detection engine:" in line or "[i] Starting correlation analysis:" in line:
-                status_text.info(line.strip().replace("[i] ", ""))
+                progress_bar.progress(progress_fraction, text=f"{int(progress_fraction*100)}% Complete")
+            elif "[i] Running detection engine:" in line:
+                msg = line.strip().replace("[i] Running detection engine: ", "Running engine: ")
+                status_text.info(msg)
+                _render_checklist(completed_plugins, msg)
+            elif "[i] Starting correlation analysis:" in line or "[i] Finished correlation" in line:
+                status_text.info("Running correlation analysis…")
+                _render_checklist(completed_plugins, "Correlating findings…")
+            elif "[WARN]" in line:
+                # Emit API fallback warning visibly
+                st.warning(line.strip().replace("[WARN] ", "⚠️ "))
 
     try:
         process.wait(timeout=900)
@@ -275,7 +671,161 @@ def load_baseline_config():
             return yaml.safe_load(f)
     return None
 
+_BUILTIN_NARRATIVES = {
+    "correlation_evasion_priv_esc": (
+        "Evasion techniques (AMSI bypass, ETW patching) were detected alongside privilege "
+        "escalation indicators (token impersonation, code injection). This combination suggests "
+        "an attacker actively suppressing defenses while elevating their access level — a "
+        "hallmark of post-exploitation activity following initial access."
+    ),
+    "correlation_lolbin_chain": (
+        "Living-off-the-land binaries (LOLBins) or WMI were detected in conjunction with "
+        "network activity or persistence mechanisms. Attackers abuse built-in system tools "
+        "to blend with normal activity while establishing command-and-control channels or "
+        "maintaining long-term access."
+    ),
+    "correlation_exfil_chain": (
+        "Archive staging artifacts were detected alongside outbound connections or suspicious "
+        "network activity. This pattern matches the Collection and Exfiltration phases of the "
+        "MITRE ATT&CK framework — data is gathered, compressed, and then transferred to "
+        "attacker-controlled infrastructure."
+    ),
+}
+
+# ---------------------------------------------------------------------------
+# Dynamic narrative helpers
+# ---------------------------------------------------------------------------
+
+_LAYER_FRIENDLY_NAMES = {
+    "process": "Process Layer",
+    "kernel":  "Kernel Layer",
+    "network": "Network Layer",
+    "system":  "System Artifact Layer",
+}
+
+def _friendly_layer_name(layer: str) -> str:
+    """Return a human-readable layer name."""
+    return _LAYER_FRIENDLY_NAMES.get(str(layer).lower(), str(layer).replace("_", " ").title())
+
+def _oxford_join(items: list) -> str:
+    """Join a list with Oxford comma: 'a, b, and c'."""
+    items = [str(i) for i in items if i and str(i) not in ("", "None", "N/A")]
+    if not items:   return "unknown activity"
+    if len(items) == 1: return items[0]
+    if len(items) == 2: return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+def build_dynamic_chain_narrative(finding: dict) -> str:
+    """
+    Generate a dynamic, evidence-specific plain-English narrative for correlated findings.
+    Uses actual correlated_chains data so every report tells the story of THIS memory image,
+    not generic boilerplate.
+    """
+    fid    = finding.get("id", "")
+    chains = finding.get("correlated_chains", [])
+
+    # No chain data → fall back to static text
+    if not chains:
+        if fid in _BUILTIN_NARRATIVES:
+            return _BUILTIN_NARRATIVES[fid]
+        return "No correlation details available for this finding."
+
+    # ----------------------------------------------------------------
+    # System-wide: group findings by layer, tell each layer's story
+    # ----------------------------------------------------------------
+    if fid == "correlation_system_wide":
+        layer_findings: dict = {}
+        for item in chains:
+            for sf in item.get("correlated_findings", []):
+                layer = sf.get("layer", "unknown")
+                ev0   = (sf.get("evidence") or [{}])[0]
+                proc  = (
+                    ev0.get("name") or ev0.get("process") or
+                    ev0.get("ImageFileName") or ev0.get("owner") or ""
+                )
+                layer_findings.setdefault(layer, []).append({
+                    "title":   sf.get("title") or sf.get("finding_id", "suspicious activity"),
+                    "process": str(proc).strip(),
+                    "pid":     str(ev0.get("PID") or ev0.get("pid") or "").strip(),
+                })
+
+        layer_names = sorted(layer_findings.keys())
+        total       = sum(len(v) for v in layer_findings.values())
+        layer_list  = _oxford_join([_friendly_layer_name(l) for l in layer_names])
+
+        parts = [
+            f"This memory image contains {total} high-severity indicator"
+            f"{'s' if total != 1 else ''} spread across "
+            f"{len(layer_names)} separate parts of the system at the same time — "
+            f"the {layer_list}. "
+            f"When threats appear simultaneously across independent system layers like this, "
+            f"it means the attacker is not just visiting: they are deeply embedded and actively "
+            f"operating across the entire machine."
+        ]
+
+        for layer in layer_names:
+            items  = layer_findings[layer]
+            fname  = _friendly_layer_name(layer)
+            titles = [i["title"] for i in items[:3]]
+            procs  = list({
+                i["process"] for i in items
+                if i["process"] not in ("", "None", "N/A")
+            })[:2]
+            proc_clause  = (f", specifically linked to {_oxford_join(procs)}" if procs else "")
+            title_clause = _oxford_join(titles)
+            parts.append(
+                f"In the {fname}{proc_clause}: {title_clause}."
+            )
+
+        parts.append(
+            "All of this is happening at the same time, which is the most alarming part. "
+            "A single suspicious process might be a false alarm. Suspicious activity across "
+            "the kernel, network, and system artifacts simultaneously points to a real, "
+            "active intrusion. The machine should be isolated immediately and not trusted "
+            "until a full forensic investigation is complete."
+        )
+        return "  ".join(parts)
+
+    # ----------------------------------------------------------------
+    # Other correlated findings: brief chain-specific narrative
+    # ----------------------------------------------------------------
+    all_titles: list = []
+    pids:       list = []
+    for item in chains:
+        pid = item.get("correlated_pid", "")
+        if pid and pid not in ("system-wide", "None", ""):
+            pids.append(str(pid))
+        for sf in item.get("correlated_findings", []):
+            t = sf.get("title") or sf.get("finding_id", "")
+            if t:
+                all_titles.append(t)
+
+    confidence   = (chains[0].get("confidence", "") if chains else "")
+    pid_clause   = (
+        f" (PID{'s' if len(pids) > 1 else ''} {', '.join(pids[:3])})" if pids else ""
+    )
+    conf_note    = {
+        "strong": "These findings were detected inside the same process",
+        "medium": "These findings are linked through a parent-child process relationship",
+        "weak":   "These findings co-exist as a behavioral pattern across this memory image",
+    }.get(confidence, "These findings were correlated")
+    finding_list = _oxford_join(all_titles[:5])
+
+    # Use the static narrative as the opening sentence if available
+    base = _BUILTIN_NARRATIVES.get(fid, "")
+    if base:
+        return f"{base}  In this image, {conf_note.lower()}{pid_clause}: {finding_list}."
+    return (
+        f"{conf_note}{pid_clause}. The following indicators were detected together: "
+        f"{finding_list}. Their simultaneous presence suggests coordinated attacker activity "
+        f"rather than isolated anomalies."
+    )
+
+
 def get_narrative(finding_id, detections_config):
+    # Programmatically-generated findings (correlations not in YAML) use built-in narratives
+    if finding_id in _BUILTIN_NARRATIVES:
+        return _BUILTIN_NARRATIVES[finding_id]
     if not detections_config: return "Detections config not found."
     for os_profile in detections_config.get('os_profiles', {}).values():
         for rule in os_profile.get('detections', []):
@@ -315,6 +865,318 @@ def categorize_findings(findings, detections_config):
 
     return counts, overall_severity, total_score
 
+# ---------------------------------------------------------------------------
+# Gemini AI helper
+# ---------------------------------------------------------------------------
+def query_gemini(api_key: str, finding: dict) -> str:
+    """Call Gemini API to explain a finding in plain English."""
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"gemini-2.0-flash:generateContent?key={api_key}"
+    )
+    # Allow callers to inject a fully-formed prompt (used by query_llm_correlated)
+    prompt = finding.get("_prompt_override") or None
+    if not prompt:
+        evidence_sample = json.dumps(finding.get("evidence", [])[:3], indent=2, ensure_ascii=False)
+        prompt = (
+            f"You are a memory forensics expert. A security analyst is reviewing this finding "
+            f"from a live memory image analysis. Explain it clearly and concisely.\n\n"
+            f"Finding Title: {finding.get('title', 'Unknown')}\n"
+            f"MITRE ATT&CK: {', '.join(finding.get('mitre', []))}\n"
+            f"Severity Score: {finding.get('weight', 0)}\n"
+            f"Evidence (sample):\n{evidence_sample}\n\n"
+            f"Provide exactly three short paragraphs:\n"
+            f"1. What this finding means in plain English\n"
+            f"2. Why it is dangerous and what the attacker is likely doing\n"
+            f"3. The top 2-3 immediate containment/investigation actions the analyst should take"
+        )
+    try:
+        resp = requests.post(
+            url,
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=20
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data["candidates"][0]["content"]["parts"][0]["text"]
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else "?"
+        print(f"[warn] Gemini API HTTP {status}: {e}", file=sys.stderr)
+        if status == 400:
+            return "⚠️ AI summary unavailable — Gemini rejected the request (invalid API key or model not available)."
+        if status == 429:
+            return "⚠️ AI summary unavailable — Gemini rate limit hit. Wait a moment and try again."
+        return "⚠️ AI summary unavailable — Gemini returned an error. Check your API key."
+    except requests.exceptions.Timeout:
+        return "⚠️ AI summary unavailable — Gemini took too long to respond. Try again shortly."
+    except Exception as e:
+        print(f"[warn] Gemini error: {e}", file=sys.stderr)
+        return "⚠️ AI summary unavailable. Use the local Ollama model as an alternative."
+
+
+# ---------------------------------------------------------------------------
+# Plotly attack-chain network graph
+# ---------------------------------------------------------------------------
+def render_attack_chain_graph(correlated_finding: dict):
+    """Render attack chain as an interactive Plotly network graph.
+
+    Reads from `correlated_chains` — the dedicated key for correlation data —
+    rather than the generic `evidence` field which is used by non-correlation findings.
+    Each chain item is {"correlated_pid": str, "correlated_findings": [...]}.
+    """
+    chains = correlated_finding.get("correlated_chains", [])
+    if not chains:
+        return
+
+    for item in chains:
+        pid = item.get("correlated_pid", "?")
+        chain_findings = item.get("correlated_findings", [])
+        confidence     = item.get("confidence", "weak")
+        corr_type      = item.get("correlation_type", "")
+        if not chain_findings:
+            continue
+
+        # Centre node colour encodes correlation strength
+        _centre_colors = {"strong": "#2ecc71", "medium": "#3498db", "weak": "#e67e22"}
+        centre_color = _centre_colors.get(confidence, "#8b949e")
+
+        # Centre label: special handling for non-PID correlation types
+        if corr_type == "system_wide":
+            centre_label = "🌐 System-Wide"
+            centre_color = "#9b59b6"   # purple — distinct from PID-based chains
+        elif corr_type == "parent_child":
+            centre_label = f"PID {pid}\n(parent)"
+        else:
+            centre_label = f"PID {pid}"
+
+        n = len(chain_findings)
+        radius = 2.2
+        angles = [math.pi / 2 + 2 * math.pi * i / n for i in range(n)]
+
+        # Node data
+        node_x = [0.0]
+        node_y = [0.0]
+        node_labels = [centre_label]
+        node_colors = [centre_color]
+        node_sizes = [28]
+        node_hover = [f"<b>Correlated PID: {pid}</b><br>Confidence: {confidence}"]
+
+        severity_colors = {
+            "psxview_hidden": "#e74c3c", "malfind_injection": "#e74c3c",
+            "ldr_unlinked_module": "#e74c3c", "handles_lsass_access": "#e74c3c",
+            "lsass_credential_dump": "#e74c3c", "entropy_anomaly": "#e74c3c",
+            "suspicious_connection": "#f39c12", "suspicious_network_enrichment": "#f39c12",
+            "suspicious_port_activity": "#f39c12", "netscan_beacon_like": "#f39c12",
+        }
+
+        edge_x, edge_y = [], []
+        for i, cf in enumerate(chain_findings):
+            fx = radius * math.cos(angles[i])
+            fy = radius * math.sin(angles[i])
+            node_x.append(fx)
+            node_y.append(fy)
+            fid = cf.get("finding_id", "")
+            title = get_user_friendly_correlated_title(fid)
+            node_labels.append(title)
+            node_colors.append(severity_colors.get(fid, "#9b59b6"))
+            node_sizes.append(20)
+            ev_count   = len(cf.get("evidence", []))
+            role       = cf.get("process_role", "")
+            role_txt   = f"<br>Role: {role}" if role else ""
+            co_pres    = " (co-presence)" if cf.get("co_presence") else ""
+            node_hover.append(f"<b>{title}</b>{co_pres}<br>Evidence items: {ev_count}{role_txt}")
+            edge_x += [0, fx, None]
+            edge_y += [0, fy, None]
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=edge_x, y=edge_y, mode="lines",
+            line=dict(width=1.5, color="#30363d"),
+            hoverinfo="none", showlegend=False
+        ))
+        fig.add_trace(go.Scatter(
+            x=node_x, y=node_y, mode="markers+text",
+            marker=dict(size=node_sizes, color=node_colors, line=dict(color="#0d1117", width=2)),
+            text=node_labels,
+            textfont=dict(color="#c9d1d9", size=11),
+            textposition=["middle center"] + ["top center"] * n,
+            hovertext=node_hover, hoverinfo="text",
+            showlegend=False
+        ))
+        fig.update_layout(
+            paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+            font=dict(color="#c9d1d9", family="Fira Code"),
+            xaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-3.5, 3.5]),
+            yaxis=dict(showgrid=False, zeroline=False, showticklabels=False, range=[-3.5, 3.5]),
+            margin=dict(l=10, r=10, t=10, b=10),
+            height=360
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+
+# ---------------------------------------------------------------------------
+# MITRE ATT&CK heatmap
+# ---------------------------------------------------------------------------
+def render_mitre_heatmap(findings: list):
+    """Render a bar chart of triggered MITRE ATT&CK techniques."""
+    tactic_map = {
+        "TA0002": "Execution", "TA0003": "Persistence", "TA0004": "Priv Escalation",
+        "TA0005": "Defense Evasion", "TA0006": "Credential Access", "TA0007": "Discovery",
+        "TA0008": "Lateral Movement", "TA0009": "Collection", "TA0010": "Exfiltration",
+        "TA0011": "C2", "TA0040": "Impact",
+        "T1055": "Process Injection", "T1003": "OS Credential Dump", "T1003.001": "LSASS Memory",
+        "T1059": "Command Scripting", "T1547.001": "Registry Run Keys", "T1053": "Scheduled Task",
+        "T1053.003": "Cron", "T1053.005": "Sched Task/Job", "T1071": "App Layer Protocol",
+        "T1014": "Rootkit", "T1036": "Masquerading", "T1027": "Obfuscated Files",
+        "T1574": "Hijack Execution Flow", "T1574.006": "LD_PRELOAD", "T1078": "Valid Accounts",
+        "T1112": "Modify Registry", "T1105": "Ingress Tool Transfer", "T1106": "Native API",
+        "T1204": "User Execution", "T1562.001": "Disable/Modify Tools",
+        "T1082": "System Info Discovery", "T1057": "Process Discovery", "T1550": "Use Alt Material",
+        "T1021": "Remote Services", "T1552": "Unsecured Credentials",
+    }
+    counts: dict = {}
+    for f in findings:
+        for tag in f.get("mitre", []):
+            label = tactic_map.get(tag, tag)
+            counts[label] = counts.get(label, 0) + 1
+
+    if not counts:
+        st.info("No MITRE ATT&CK tags found in current findings.")
+        return
+
+    sorted_items = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+    labels = [i[0] for i in sorted_items]
+    values = [i[1] for i in sorted_items]
+    colors = ["#e74c3c" if v >= 3 else "#f39c12" if v == 2 else "#2ecc71" for v in values]
+
+    fig = go.Figure(go.Bar(
+        x=values, y=labels, orientation="h",
+        marker=dict(color=colors),
+        text=[str(v) for v in values], textposition="outside",
+        textfont=dict(color="#c9d1d9")
+    ))
+    fig.update_layout(
+        paper_bgcolor="#0d1117", plot_bgcolor="#161b22",
+        font=dict(color="#c9d1d9", family="Fira Code"),
+        xaxis=dict(showgrid=True, gridcolor="#21262d", color="#c9d1d9", title="Number of Findings"),
+        yaxis=dict(showgrid=False, color="#c9d1d9", autorange="reversed"),
+        margin=dict(l=10, r=60, t=10, b=40),
+        height=max(300, len(labels) * 28)
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# ---------------------------------------------------------------------------
+# Timeline from shimcache / amcache artifacts
+# ---------------------------------------------------------------------------
+def _build_timeline_rows(project_name: str) -> list:
+    """
+    Shared helper — load and filter shimcache/amcache artifacts into a list of
+    {'Timestamp', 'Artifact', 'Description'} dicts.  Used by both render_timeline()
+    and the summary panel so the count is always consistent with what renders.
+    """
+    artifacts_dir = OUTPUT_FOLDER / project_name / "artifacts"
+    rows = []
+
+    # ── Shimcache ──────────────────────────────────────────────────────────────
+    shimcache_path = artifacts_dir / "windows_registry_shimcache.csv"
+    if shimcache_path.exists():
+        try:
+            df_sc = pd.read_csv(shimcache_path, on_bad_lines="skip")
+            ts_col = next(
+                (c for c in df_sc.columns if re.search(r"(modified|time|date|last)", c, re.I)), None
+            )
+            path_col = next(
+                (c for c in df_sc.columns if re.search(r"(path|file|application)", c, re.I)), None
+            )
+            if ts_col and path_col:
+                for _, row in df_sc.dropna(subset=[ts_col, path_col]).head(100).iterrows():
+                    ts_val = str(row[ts_col])[:19]
+                    if ts_val not in ("N/A", "nan", "None", ""):
+                        rows.append({
+                            "Timestamp": ts_val,
+                            "Artifact": "Shimcache",
+                            "Description": str(row[path_col]),
+                        })
+        except Exception:
+            pass
+
+    # ── Amcache ────────────────────────────────────────────────────────────────
+    amcache_path = artifacts_dir / "windows_registry_amcache.csv"
+    if amcache_path.exists():
+        try:
+            df_am = pd.read_csv(amcache_path, on_bad_lines="skip")
+            ts_col = next(
+                (c for c in df_am.columns if re.search(r"(time|date|modified|write)", c, re.I)), None
+            )
+            path_col = next(
+                (c for c in df_am.columns if re.search(r"(path|file|name|ref)", c, re.I)), None
+            )
+            if ts_col and path_col:
+                for _, row in df_am.dropna(subset=[ts_col, path_col]).head(100).iterrows():
+                    ts_val = str(row[ts_col])[:19]
+                    if ts_val not in ("N/A", "nan", "None", ""):
+                        rows.append({
+                            "Timestamp": ts_val,
+                            "Artifact": "Amcache",
+                            "Description": str(row[path_col]),
+                        })
+        except Exception:
+            pass
+
+    return rows
+
+
+def render_timeline(project_name: str):
+    """Load shimcache/amcache artifacts and render a timeline scatter plot."""
+    timeline_rows = _build_timeline_rows(project_name)
+
+    if not timeline_rows:
+        st.markdown(
+            '<div class="empty-state">'
+            '<div class="es-icon">🕒</div>'
+            '<div class="es-title">No timeline artifacts found.</div>'
+            '<div class="es-sub">This may occur if the memory image lacks execution history (Shimcache/Amcache).<br>'
+            'Timeline data is only available for Windows images where registry hives are present in memory.</div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    df = pd.DataFrame(timeline_rows)
+    try:
+        df["Timestamp"] = pd.to_datetime(df["Timestamp"], errors="coerce")
+        df = df.dropna(subset=["Timestamp"]).sort_values("Timestamp")
+    except Exception:
+        pass
+
+    color_map = {"Shimcache": "#2ecc71", "Amcache": "#3498db"}
+    fig = px.scatter(
+        df, x="Timestamp", y="Artifact",
+        color="Artifact", color_discrete_map=color_map,
+        hover_data={"Description": True, "Timestamp": True, "Artifact": False},
+        title="Execution Timeline (Shimcache / Amcache)"
+    )
+    fig.update_traces(marker=dict(size=10, symbol="diamond"))
+    fig.update_layout(
+        paper_bgcolor="#0d1117", plot_bgcolor="#161b22",
+        font=dict(color="#c9d1d9", family="Fira Code"),
+        xaxis=dict(showgrid=True, gridcolor="#21262d", color="#c9d1d9"),
+        yaxis=dict(showgrid=False, color="#c9d1d9"),
+        title_font_color="#2ecc71",
+        margin=dict(l=10, r=10, t=50, b=40),
+        height=320,
+        legend=dict(bgcolor="#161b22", bordercolor="#30363d")
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander("View raw timeline data"):
+        df_disp = df.copy()
+        if "Timestamp" in df_disp.columns:
+            df_disp["Timestamp"] = df_disp["Timestamp"].astype(str)
+        st.dataframe(df_disp, use_container_width=True, hide_index=True)
+
+
 def get_user_friendly_correlated_title(finding_id):
     """Maps internal finding IDs to user-friendly titles for the correlated findings steps."""
     mapping = {
@@ -330,6 +1192,20 @@ def get_user_friendly_correlated_title(finding_id):
         'filescan_suspicious_names': 'Suspicious File Found',
         'unusual_parent_child': 'Unusual Parent Process',
         'bash_history_suspicious': 'Suspicious Shell Command',
+        # Modern attack technique detections
+        'amsi_bypass': 'AMSI Bypass Detected',
+        'etw_patching': 'ETW Patching / Audit Evasion',
+        'token_impersonation': 'Token Impersonation / Privilege Abuse',
+        'lateral_movement_ports': 'Lateral Movement Port Activity',
+        'wmi_suspicious_spawn': 'WMI Suspicious Process Spawn',
+        'lolbin_enhanced': 'Living-off-the-Land Binary Abuse',
+        'archive_staging': 'Archive Staging for Exfiltration',
+        'exfil_connections': 'Bulk Exfiltration Connections',
+        # Correlation rule IDs
+        'correlation_evasion_priv_esc': 'Evasion + Privilege Escalation Chain',
+        'correlation_lolbin_chain': 'LOLBin Lateral Movement Chain',
+        'correlation_exfil_chain': 'Staging + Exfiltration Chain',
+        'correlation_system_wide': 'System-Wide Compromise — Multi-Layer Indicators',
     }
     return mapping.get(finding_id, finding_id.replace('_', ' ').title())
 
@@ -340,16 +1216,40 @@ def render_correlated_finding_narrative(finding, detections_config):
     html_content_title = f"<h4 style='color: #2ecc71;'><span style='text-decoration: none; color: inherit;'>{html_escape(finding.get('title', 'Correlated Threat'))}</span></h4>"
     html(html_content_title, height=45)
 
-    st.markdown(f"<p style='font-size: 1.1rem; color: #c9d1d9; text-decoration: none;'>{html_escape(get_narrative(finding.get('id'), detections_config))}</p>", unsafe_allow_html=True)
+    # Use dynamic narrative that reflects the actual findings in THIS image
+    narrative_text = build_dynamic_chain_narrative(finding)
+    st.markdown(
+        f"<p style='font-size: 1.05rem; color: #c9d1d9; line-height: 1.7;'>"
+        f"{html_escape(narrative_text)}</p>",
+        unsafe_allow_html=True,
+    )
 
-    evidence_list = finding.get('evidence', [])
-    if not evidence_list:
-        st.write("No detailed evidence for this correlated finding.")
+    # Correlation findings store their data in correlated_chains, not evidence
+    chain_list = finding.get('correlated_chains', [])
+    if not chain_list:
+        st.write("No correlated chain details available for this finding.")
         return
 
-    for item in evidence_list:
-        pid = item.get('correlated_pid')
-        html_content_pid = f"<h5 style='color: #2ecc71;'><span style='text-decoration: none; color: inherit;'>Involved Process ID (PID): `{html_escape(str(pid))}`</span></h5>"
+    for item in chain_list:
+        pid      = item.get('correlated_pid')
+        corr_type = item.get('correlation_type', '')
+        if corr_type == "system_wide":
+            layers = item.get('layers_involved', [])
+            layer_txt = ", ".join(layers) if layers else "multiple layers"
+            html_content_pid = (
+                f"<h5 style='color:#9b59b6;'><span style='text-decoration:none;color:inherit;'>"
+                f"🌐 System-Wide Indicators — spans: {html_escape(layer_txt)}</span></h5>"
+            )
+        elif corr_type == "parent_child":
+            html_content_pid = (
+                f"<h5 style='color:#3498db;'><span style='text-decoration:none;color:inherit;'>"
+                f"Parent Process PID: `{html_escape(str(pid))}`</span></h5>"
+            )
+        else:
+            html_content_pid = (
+                f"<h5 style='color: #2ecc71;'><span style='text-decoration: none; color: inherit;'>"
+                f"Involved Process ID (PID): `{html_escape(str(pid))}`</span></h5>"
+            )
         html(html_content_pid, height=35)
         findings_details = item.get('correlated_findings', [])
 
@@ -413,6 +1313,48 @@ def render_correlated_finding_narrative(finding, detections_config):
                 cmd = primary_evidence_item.get('Command')
                 user = primary_evidence_item.get('User', 'A user')
                 description_parts.append(f"{html_escape(str(user))} executed a **suspicious command**.")
+            elif finding_id == 'amsi_bypass':
+                process = primary_evidence_item.get('process') or primary_evidence_item.get('name', 'A process')
+                pattern = primary_evidence_item.get('pattern', 'unknown pattern')
+                description_parts.append(f"<code>{html_escape(str(process))}</code> attempted to **disable AMSI** (Anti-Malware Scan Interface) using: <code>{html_escape(str(pattern))}</code>, preventing detection of malicious scripts.")
+            elif finding_id == 'etw_patching':
+                process = primary_evidence_item.get('process') or primary_evidence_item.get('name', 'A process')
+                pattern = primary_evidence_item.get('pattern', 'audit-disabling command')
+                description_parts.append(f"<code>{html_escape(str(process))}</code> patched **Event Tracing for Windows (ETW)** or manipulated audit logs (<code>{html_escape(str(pattern))}</code>), blinding security monitoring.")
+            elif finding_id == 'token_impersonation':
+                process = primary_evidence_item.get('process') or primary_evidence_item.get('name', 'A process')
+                handle_type = primary_evidence_item.get('type', 'Token')
+                description_parts.append(f"<code>{html_escape(str(process))}</code> obtained a **privileged token handle** ({html_escape(str(handle_type))}) — indicative of token impersonation or privilege escalation.")
+            elif finding_id == 'lateral_movement_ports':
+                process = primary_evidence_item.get('process') or primary_evidence_item.get('owner', 'A process')
+                port = primary_evidence_item.get('ForeignPort') or primary_evidence_item.get('port', 'unknown')
+                dst = primary_evidence_item.get('ForeignAddr', '')
+                dst_info = f" → <code>{html_escape(str(dst))}</code>" if dst and dst not in ['None', '0.0.0.0'] else ''
+                description_parts.append(f"<code>{html_escape(str(process))}</code> connected on **lateral movement port {html_escape(str(port))}**{dst_info}, suggesting remote execution or file share access.")
+            elif finding_id == 'wmi_suspicious_spawn':
+                parent = primary_evidence_item.get('parent_name') or primary_evidence_item.get('Parent', 'WmiPrvSE')
+                child = primary_evidence_item.get('name') or primary_evidence_item.get('Child', 'cmd.exe')
+                description_parts.append(f"**WMI** (<code>{html_escape(str(parent))}</code>) spawned <code>{html_escape(str(child))}</code> — a classic **WMI lateral movement or persistence** technique used to execute commands without direct process invocation.")
+            elif finding_id == 'lolbin_enhanced':
+                process = primary_evidence_item.get('process') or primary_evidence_item.get('name', 'A LOLBin')
+                matched = primary_evidence_item.get('matched_pattern') or primary_evidence_item.get('pattern', '')
+                extra = f" (pattern: <code>{html_escape(str(matched))}</code>)" if matched else ""
+                description_parts.append(f"**Living-off-the-Land binary** <code>{html_escape(str(process))}</code> was abused{extra} to proxy execution, download payloads, or bypass application controls.")
+            elif finding_id == 'archive_staging':
+                path = primary_evidence_item.get('path') or primary_evidence_item.get('Path', 'unknown path')
+                description_parts.append(f"An **archive file** was created at a staging location: <code>{html_escape(str(path))}</code> — consistent with data collection prior to exfiltration.")
+            elif finding_id == 'exfil_connections':
+                process = primary_evidence_item.get('process') or primary_evidence_item.get('owner', 'A process')
+                count = primary_evidence_item.get('connection_count', '')
+                count_info = f" ({html_escape(str(count))} connections)" if count else ""
+                description_parts.append(f"<code>{html_escape(str(process))}</code> maintained **multiple simultaneous outbound connections**{count_info} to external hosts, consistent with bulk data exfiltration.")
+            elif f_details.get('layer'):
+                # System-wide chain: each item carries a 'layer' label
+                layer_label = html_escape(f_details.get('layer', 'Unknown Layer'))
+                description_parts.append(
+                    f"<b>[{layer_label}]</b> — {html_escape(get_user_friendly_correlated_title(finding_id))} "
+                    f"detected as part of a multi-layer intrusion pattern."
+                )
             else:
                 description_parts.append(html_escape(get_narrative(finding_id, detections_config)))
 
@@ -560,6 +1502,7 @@ def render_evidence_as_table(evidence_list, finding_id):
 
 artifact_descriptions = {
     "report.html": {"title": "Full Analysis Report (HTML)", "description": "The complete HTML analysis report generated by DeepProbe."},
+    "report.pdf":  {"title": "PDF Report (Shareable)", "description": "Professional PDF report suitable for sharing with stakeholders. Includes verdict, high-severity findings, attack chains, and timeline."},
     "findings.jsonl": {"title": "Detected Findings (JSONL Data)", "description": "Raw JSON Lines format of all detected forensic findings."},
     "console_output.log": {"title": "CLI Console Output Log", "description": "Comprehensive log of the analysis process and console output."},
     "memory_dump.raw": {"title": "Raw Memory Dump File", "description": "The raw memory image file (if a copy was made)."},
@@ -607,7 +1550,7 @@ artifact_descriptions = {
     "windows_modscan.txt": {"title": "Windows Kernel Module Scan", "description": "Scans for loaded kernel modules and drivers, identifying potentially hidden or malicious ones."},
     "windows_consoles.txt": {"title": "Windows Console History", "description": "Recovers command history from console windows (cmd.exe, PowerShell), revealing user activity or attacker commands."},
     "windows_clipboard.txt": {"title": "Windows Clipboard Contents", "description": "Recovers data from the system clipboard, potentially containing sensitive information copied by a user or malware."},
-    "windows_registry_shimcache.txt": {"title": "Windows Registry: Shimcache (AppCompatCache)", "description": "Records metadata about recently executed applications, useful for execution artifacts and determining program compatibility."},
+    "windows_registry_shimcache.csv": {"title": "Windows Registry: Shimcache (AppCompatCache)", "description": "Records metadata about recently executed applications, useful for execution artifacts and determining program compatibility."},
     "windows_registry_amcache.csv": {"title": "Windows Registry: Amcache", "description": "Provides detailed information about executed programs and their hash values, often used in forensics."},
     "windows_envars.txt": {"title": "Windows Environment Variables", "description": "Lists environment variables for processes, which can sometimes contain paths to malicious tools or configurations."},
     "windows_callbacks.txt": {"title": "Windows Kernel Callbacks", "description": "Lists registered kernel callbacks, which can be hooked by rootkits for stealthy operations."},
@@ -644,12 +1587,17 @@ artifact_descriptions = {
 def main():
     print("[DEBUG] DeepProbe UI: main() function started.")
 
-    st.set_page_config(page_title="DeepProbe | Memory Forensics", page_icon="🕵️", layout="wide", initial_sidebar_state="expanded")
+    # Note: st.set_page_config() is called at module level (top of file) so it
+    # fires before any other st.* command. Do NOT call it again here.
 
     if 'analysis_successful' not in st.session_state: st.session_state.analysis_successful = False
     if 'active_page' not in st.session_state: st.session_state.active_page = "Home"
     if 'project_name' not in st.session_state: st.session_state.project_name = ""
     if 'ip_enrichment_api_key' not in st.session_state: st.session_state.ip_enrichment_api_key = ""
+    if 'gemini_api_key' not in st.session_state: st.session_state.gemini_api_key = ""
+    if 'selected_model' not in st.session_state: st.session_state.selected_model = DEFAULT_MODEL
+    if 'dark_mode' not in st.session_state: st.session_state.dark_mode = True
+    if 'ai_responses' not in st.session_state: st.session_state.ai_responses = {}
 
     # Custom dark theme and hacker vibe CSS
     st.markdown("""
@@ -792,6 +1740,92 @@ def main():
             color: #2ecc71;
             text-shadow: 0 0 5px rgba(46, 204, 113, 0.2);
         }
+
+        /* --- Capability Groups --- */
+        .cap-group {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 10px;
+            padding: 1rem 1.2rem 0.8rem 1.2rem;
+            margin-bottom: 0.85rem;
+        }
+        .cap-group-header {
+            font-size: 0.95rem;
+            font-weight: 700;
+            color: #2ecc71;
+            margin-bottom: 0.5rem;
+            letter-spacing: 0.02em;
+        }
+        .cap-group.highlight {
+            border-color: #2ecc71;
+            box-shadow: 0 0 12px rgba(46, 204, 113, 0.15);
+        }
+        .cap-item {
+            display: inline-block;
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 5px;
+            font-size: 0.78rem;
+            color: #c9d1d9;
+            padding: 0.2rem 0.55rem;
+            margin: 0.2rem 0.2rem 0.2rem 0;
+        }
+
+        /* --- Feature Badges --- */
+        .badge-row { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 0.5rem 0 0.8rem 0; }
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.3rem;
+            background: #0d1117;
+            border: 1px solid #2ecc71;
+            border-radius: 20px;
+            padding: 0.22rem 0.7rem;
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: #2ecc71;
+            white-space: nowrap;
+        }
+
+        /* --- Summary Panel --- */
+        .summary-panel {
+            display: flex;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+            margin: 0.75rem 0 1.2rem 0;
+        }
+        .summary-card {
+            flex: 1;
+            min-width: 90px;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 0.6rem 0.8rem;
+            text-align: center;
+        }
+        .summary-card .s-value {
+            font-size: 1.6rem;
+            font-weight: 700;
+            color: #2ecc71;
+            line-height: 1.1;
+        }
+        .summary-card .s-label {
+            font-size: 0.7rem;
+            color: #8b949e;
+            margin-top: 0.15rem;
+        }
+
+        /* --- Empty State --- */
+        .empty-state {
+            text-align: center;
+            padding: 2rem 1rem;
+            border: 1px dashed #30363d;
+            border-radius: 10px;
+            margin: 1rem 0;
+        }
+        .empty-state .es-icon { font-size: 2.2rem; margin-bottom: 0.4rem; }
+        .empty-state .es-title { font-size: 1rem; font-weight: 700; color: #c9d1d9; margin-bottom: 0.3rem; }
+        .empty-state .es-sub { font-size: 0.82rem; color: #8b949e; }
         
         .card.critical { border-left: 8px solid #f85149 !important; }
         .card.high { border-left: 8px solid #ff7b72 !important; }
@@ -1016,29 +2050,143 @@ def main():
         """, unsafe_allow_html=True)
 
 
+    # Inject light-mode overrides when user toggles theme
+    if not st.session_state.dark_mode:
+        st.markdown("""
+        <style>
+        html, body, [data-testid="stAppViewContainer"] {
+            background-color: #f6f8fa !important;
+            color: #24292f !important;
+        }
+        [data-testid="stAppViewContainer"] > .main { background-color: #f6f8fa !important; }
+        [data-testid="stSidebar"] { background-color: #ffffff !important; border-right: 1px solid #d0d7de !important; }
+        .header { background-color: #ffffff !important; border-bottom: 1px solid #d0d7de !important; }
+        .header h1 { color: #1a7f37 !important; }
+        .stButton > button { background-color: #f6f8fa !important; color: #1a7f37 !important; border-color: #d0d7de !important; }
+        .card, .verdict-box, .narrative-block, .findings-narrative-item,
+        .attack-step, .artifact-card { background-color: #ffffff !important; border-color: #d0d7de !important; color: #24292f !important; }
+        [data-testid="stDataFrame"] { background-color: #ffffff !important; color: #24292f !important; }
+        [data-testid="stDataFrame"] thead th { background-color: #f6f8fa !important; color: #1a7f37 !important; border-bottom: 2px solid #1a7f37 !important; }
+        [data-testid="stDataFrame"] tbody tr td { background-color: #ffffff !important; color: #24292f !important; }
+        h1, h2, h3, h4, h5, h6 { color: #1a7f37 !important; }
+        p, li, span, label { color: #24292f !important; }
+        .stTextInput input, .stTextArea textarea { background-color: #ffffff !important; color: #24292f !important; border-color: #d0d7de !important; }
+        </style>
+        """, unsafe_allow_html=True)
+
     st.markdown('<div class="header"><h1>DeepProbe</h1><span>Memory Forensics Framework</span></div>', unsafe_allow_html=True)
 
     with st.sidebar:
         st.markdown("<h2 style='color: #2ecc71;'>About DeepProbe</h2>", unsafe_allow_html=True)
         st.write(
-            "**DeepProbe** is an automated framework that enhances memory forensics by building upon the powerful **Volatility 3** engine. "
-            "Its intelligent analysis engine correlates disparate artifacts from memory to identify complex threat patterns and uncover attack chains that might otherwise be missed."
+            "**DeepProbe** is a memory forensics engine built on **Volatility 3** that detects, "
+            "correlates, and explains in memory threats.\n\n"
+            "It goes beyond individual indicators by reconstructing **attack chains** and "
+            "**timelines**, helping analysts understand how an intrusion unfolds.\n\n"
+            "AI assisted explanations run fully locally via **Ollama**, ensuring sensitive "
+            "data never leaves your environment."
+        )
+        st.markdown(
+            '<div class="badge-row">'
+            '<span class="badge">🔗 Correlation Engine</span>'
+            '<span class="badge">🌐 OSINT Enrichment</span>'
+            '<span class="badge">🤖 Local AI (Ollama)</span>'
+            '</div>',
+            unsafe_allow_html=True,
         )
         st.markdown("---")
-        st.markdown("<h2 style='color: #2ecc71;'>Supported Formats</h2>", unsafe_allow_html=True)
-        st.info(f"Place your memory image file inside the `{html_escape(str(MEMORY_FOLDER.name))}/` folder.")
-        st.markdown("- Raw Memory Dumps (`.raw`, `.mem`, `.bin`)\n- VMware Snapshots (`.vmem`)\n- Hibernation Files (`hiberfil.sys`)")
+
+        # ── AI Engine (Ollama) ───────────────────────────────────────────
+        st.markdown("<h2 style='color: #2ecc71;'>🤖 AI Engine</h2>", unsafe_allow_html=True)
+
+        ollama_ok = check_ollama_health()
+        if ollama_ok:
+            st.success("🟢 Ollama connected")
+        else:
+            st.error("🔴 Ollama not reachable")
+            st.caption(f"Expected at `{OLLAMA_HOST}`. Start with `docker compose up`.")
+
+        if ollama_ok:
+            pulled_models = get_ollama_models()
+
+            # Model selector — show pulled models first, then recommended ones not yet pulled
+            all_options = pulled_models + [
+                m for m in RECOMMENDED_MODELS if m not in pulled_models
+            ]
+            # Preserve unique ordering
+            seen = set()
+            display_options = []
+            for m in all_options:
+                if m not in seen:
+                    display_options.append(m)
+                    seen.add(m)
+
+            def _model_label(name):
+                suffix = " ✅" if name in pulled_models else " ⬇️ (not downloaded)"
+                return name + suffix
+
+            selected_label = st.selectbox(
+                "Model",
+                options=display_options,
+                index=display_options.index(st.session_state.selected_model)
+                      if st.session_state.selected_model in display_options else 0,
+                format_func=_model_label,
+                help="✅ = already downloaded. ⬇️ = will be downloaded on first Ask AI click."
+            )
+            st.session_state.selected_model = selected_label
+
+            # Manual pull button
+            if selected_label not in pulled_models:
+                if st.button(f"⬇️ Download {selected_label} now"):
+                    with st.spinner(f"Downloading {selected_label} — this may take a few minutes…"):
+                        ok, msg = pull_ollama_model(selected_label)
+                    if ok:
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+            else:
+                st.caption(f"Model `{selected_label}` is ready.")
+
         st.markdown("---")
-        
+
+        # ── Gemini override (advanced / optional) ───────────────────────
+        with st.expander("⚙️ Advanced: Gemini API override"):
+            st.caption(
+                "Provide a Gemini key only if you prefer cloud inference over local Ollama. "
+                "**Warning:** findings (including extracted memory data) will be sent to Google."
+            )
+            gemini_key_input = st.text_input(
+                "Gemini API Key",
+                value=st.session_state.gemini_api_key,
+                type="password",
+                key="sidebar_gemini_key"
+            )
+            st.session_state.gemini_api_key = gemini_key_input
+
+        st.markdown("---")
+
+        # ── Supported formats ────────────────────────────────────────────
+        st.markdown("<h2 style='color: #2ecc71;'>Supported Formats</h2>", unsafe_allow_html=True)
+        st.info(f"Place memory images inside the `{html_escape(str(MEMORY_FOLDER.name))}/` folder.")
+        st.markdown("- Raw dumps (`.raw`, `.mem`, `.bin`)\n- VMware snapshots (`.vmem`)\n- Hibernation files (`hiberfil.sys`)")
+        st.markdown("---")
+
+        # ── Configuration ────────────────────────────────────────────────
         st.markdown("<h2 style='color: #2ecc71;'>Configuration</h2>", unsafe_allow_html=True)
         if st.button("View Baseline"):
             st.session_state.active_page = "Baseline"
             st.rerun()
-
         if st.button("View Detections"):
             st.session_state.active_page = "Detections"
             st.rerun()
 
+        st.markdown("---")
+        st.markdown("<h2 style='color: #2ecc71;'>Theme</h2>", unsafe_allow_html=True)
+        theme_label = "🌙 Dark Mode" if st.session_state.dark_mode else "☀️ Light Mode"
+        if st.button(theme_label):
+            st.session_state.dark_mode = not st.session_state.dark_mode
+            st.rerun()
 
         st.markdown('<div class="sidebar-footer">', unsafe_allow_html=True)
         if st.button("New Analysis / Home"):
@@ -1186,22 +2334,59 @@ def render_home_page(status_text_global, progress_bar_global):
         with st.form("analysis_form"):
             project_name = st.text_input("**Project Name**")
             memory_file_name = st.text_input("**Memory File Name**")
-            ip_enrichment_api_key = st.text_input("**IP Enrichment API Key (Optional)**", type="password")
-            
-            submitted = st.form_submit_button("Launch Analysis")
+            ip_enrichment_api_key = st.text_input(
+                "**IP Enrichment API Key (Optional)**",
+                type="password",
+                help="AbuseIPDB API key for IP reputation scoring. Falls back to ipinfo.io if blank or on failure."
+            )
+            st.caption("💡 AI explanations use the local Ollama model selected in the sidebar — no API key required. "
+                       "A Gemini override is available under ⚙️ Advanced in the sidebar if you prefer cloud AI.")
+            submitted = st.form_submit_button("🚀 Launch Analysis")
         
     with col2:
         st.markdown("<h2 style='color: #2ecc71;'>Analysis Capabilities</h2>", unsafe_allow_html=True)
         st.markdown("""
-            <div class="scan-widget-grid">
-                <div class="scan-widget"><div class="title">Hidden Process Detection</div></div>
-                <div class="scan-widget"><div class="title">Unlinked Module Analysis</div></div>
-                <div class="scan-widget"><div class="title">Risky Network Connections</div></div>
-                <div class="scan-widget"><div class="title">Suspicious Port Usage</div></div>
-                <div class="scan-widget"><div class="title">Process Hollowing</div></div>
-                <div class="scan-widget"><div class="title">Code Injection</div></div>
-                <div class="scan-widget"><div class="title">Suspicious Command Lines</div></div>
-                <div class="scan-widget"><div class="title">Registry Persistence</div></div>
+            <div class="cap-group">
+                <div class="cap-group-header">🧠 Core Memory Analysis</div>
+                <span class="cap-item">Hidden Process Detection</span>
+                <span class="cap-item">Process Hollowing</span>
+                <span class="cap-item">Code Injection</span>
+                <span class="cap-item">Unlinked Module Detection</span>
+                <span class="cap-item">Entropy / Shellcode Analysis</span>
+                <span class="cap-item">AMSI Bypass Detection</span>
+                <span class="cap-item">ETW Patching</span>
+                <span class="cap-item">Token Impersonation</span>
+            </div>
+            <div class="cap-group">
+                <div class="cap-group-header">🌐 Network &amp; Threat Intelligence</div>
+                <span class="cap-item">Suspicious Network Connections</span>
+                <span class="cap-item">Suspicious Port Usage</span>
+                <span class="cap-item">Lateral Movement Ports</span>
+                <span class="cap-item">IP Reputation (OSINT-based)</span>
+                <span class="cap-item">Bulk Exfiltration Detection</span>
+            </div>
+            <div class="cap-group">
+                <div class="cap-group-header">🔐 Credential &amp; Access Monitoring</div>
+                <span class="cap-item">LSASS Access Detection</span>
+                <span class="cap-item">Credential Dumping Indicators</span>
+                <span class="cap-item">WMI Suspicious Spawns</span>
+                <span class="cap-item">LOLBin Abuse</span>
+            </div>
+            <div class="cap-group">
+                <div class="cap-group-header">⚙️ Persistence &amp; Execution</div>
+                <span class="cap-item">Registry Run Key Persistence</span>
+                <span class="cap-item">Suspicious Command Lines</span>
+                <span class="cap-item">Scheduled Tasks &amp; Services</span>
+                <span class="cap-item">Archive Staging</span>
+                <span class="cap-item">Execution from Temp Paths</span>
+            </div>
+            <div class="cap-group highlight">
+                <div class="cap-group-header">🔗 Advanced Analysis</div>
+                <span class="cap-item">Attack Chain Correlation</span>
+                <span class="cap-item">Timeline Reconstruction</span>
+                <span class="cap-item">Multi-Stage Threat Detection</span>
+                <span class="cap-item">MITRE ATT&amp;CK Mapping</span>
+                <span class="cap-item">Local AI Explanations</span>
             </div>
         """, unsafe_allow_html=True)
 
@@ -1230,7 +2415,9 @@ def render_home_page(status_text_global, progress_bar_global):
                 else:
                     st.session_state.project_name = project_name
                     st.session_state.ip_enrichment_api_key = ip_enrichment_api_key
-    
+                    # gemini_api_key is managed via the sidebar Advanced expander — don't overwrite it here
+                    st.session_state.ai_responses = {}
+
                     progress_bar_global.progress(0, text="0% Complete")
     
                     success = run_analysis_and_show_progress(
@@ -1303,23 +2490,78 @@ def render_results_page():
         st.success("Analysis completed, and no suspicious findings were detected.")
         return
 
-    report_tab, artifacts_tab = st.tabs(["Analysis Report", "Raw Artifacts"])
+    # --- Summary panel -----------------------------------------------------------
+    # Use the same helper as render_timeline() so the count is always consistent
+    # with what actually renders in the Timeline tab.
+    _timeline_count = len(_build_timeline_rows(st.session_state.project_name))
+
+    st.markdown(
+        f'<div class="summary-panel">'
+        f'<div class="summary-card"><div class="s-value">{len(findings)}</div><div class="s-label">Total Findings</div></div>'
+        f'<div class="summary-card"><div class="s-value">{len(correlated_findings)}</div><div class="s-label">Correlated Chains</div></div>'
+        f'<div class="summary-card"><div class="s-value">{len(regular_findings)}</div><div class="s-label">Individual Findings</div></div>'
+        f'<div class="summary-card"><div class="s-value">{_timeline_count if _timeline_count else "—"}</div><div class="s-label">Timeline Events</div></div>'
+        f'<div class="summary-card"><div class="s-value">{total_score}</div><div class="s-label">Risk Score</div></div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    report_tab, attack_tab, timeline_tab, mitre_tab, artifacts_tab = st.tabs([
+        "📋 Analysis Report",
+        "🕸️ Attack Chain Graph",
+        "⏱️ Timeline",
+        "🎯 MITRE ATT&CK",
+        "📁 Raw Artifacts"
+    ])
 
     with report_tab:
         st.markdown("<h2 style='color: #2ecc71;'>Analysis Summary</h2>", unsafe_allow_html=True)
-        st.markdown(f"""
-        <div class="severity-grid">
-            <div class="severity-box critical"><div class="severity-title">Critical</div><div class="severity-count">{severity_counts['Critical']}</div></div>
-            <div class="severity-box high"><div class="severity-title">High</div><div class="severity-count">{severity_counts['High']}</div></div>
-            <div class="severity-box medium"><div class="severity-title">Medium</div><div class="severity-count">{severity_counts['Medium']}</div></div>
-            <div class="severity-box low"><div class="severity-title">Low</div><div class="severity-count">{severity_counts['Low']}</div></div>
-        </div>
-        """, unsafe_allow_html=True)
+
+        # --- Severity donut chart ---
+        donut_labels = ["Critical", "High", "Medium", "Low", "Informational"]
+        donut_values = [severity_counts[l] for l in donut_labels]
+        donut_colors = ["#e74c3c", "#ff7b72", "#e3b341", "#2ecc71", "#8b949e"]
+        if sum(donut_values) > 0:
+            donut_fig = go.Figure(go.Pie(
+                labels=donut_labels,
+                values=donut_values,
+                hole=0.55,
+                marker=dict(colors=donut_colors, line=dict(color="#0d1117", width=2)),
+                textinfo="label+value",
+                textfont=dict(color="#c9d1d9", size=12),
+                hovertemplate="<b>%{label}</b><br>Count: %{value}<extra></extra>",
+            ))
+            donut_fig.add_annotation(
+                text=f"<b>{sum(donut_values)}</b><br>findings",
+                x=0.5, y=0.5, font=dict(size=16, color="#c9d1d9"), showarrow=False
+            )
+            donut_fig.update_layout(
+                paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+                showlegend=True,
+                legend=dict(bgcolor="#161b22", bordercolor="#30363d", font=dict(color="#c9d1d9")),
+                margin=dict(l=20, r=20, t=20, b=20),
+                height=300
+            )
+            col_donut, col_stats = st.columns([1, 1])
+            with col_donut:
+                st.plotly_chart(donut_fig, use_container_width=True)
+            with col_stats:
+                st.markdown("<br>", unsafe_allow_html=True)
+                for label, color in zip(donut_labels, donut_colors):
+                    count = severity_counts[label]
+                    st.markdown(
+                        f"<div style='display:flex;align-items:center;gap:10px;margin-bottom:8px;'>"
+                        f"<div style='width:14px;height:14px;border-radius:3px;background:{color};flex-shrink:0;'></div>"
+                        f"<span style='color:#c9d1d9;font-size:1rem;'><b>{label}</b>: {count}</span></div>",
+                        unsafe_allow_html=True
+                    )
+        else:
+            st.info("No findings to display in severity chart.")
         st.markdown("---")
 
         if correlated_findings:
             st.markdown("<h2 style='color: #2ecc71;'>The Attack Story: How DeepProbe Uncovered the Threat</h2>", unsafe_allow_html=True)
-            st.write("DeepProbe analyzed multiple indicators to build a high-confidence narrative of a potential attack. The following shows the attack flow step-by-step.")
+            st.write("DeepProbe correlated multiple indicators to build a high-confidence narrative. Below is the step-by-step attack flow.")
             sorted_correlated_findings = sorted(correlated_findings, key=lambda f: f['weight'], reverse=True)
             for f in sorted_correlated_findings:
                 render_correlated_finding_narrative(f, detections_config)
@@ -1337,9 +2579,17 @@ def render_results_page():
                     finding_severity_class = band['label'].lower()
                     break
 
+            # Correlated findings: use the dynamic chain narrative builder so the text
+            # is specific to THIS analysis (not generic boilerplate or "Narrative not found.")
+            fid_for_narr = f.get('id', '')
+            if fid_for_narr.startswith('correlation_'):
+                narrative_for_item = build_dynamic_chain_narrative(f)
+            else:
+                narrative_for_item = get_narrative(fid_for_narr, detections_config)
+
             st.markdown(f"""
                 <div class='findings-narrative-item {finding_severity_class}'>
-                    <strong style='color: #2ecc71;'>{html_escape(f.get('title'))}:</strong> <span style='color: #c9d1d9;'>{html_escape(get_narrative(f.get('id'), detections_config))}</span>
+                    <strong style='color: #2ecc71;'>{html_escape(f.get('title', fid_for_narr))}:</strong> <span style='color: #c9d1d9;'>{html_escape(narrative_for_item)}</span>
                 </div>
             """, unsafe_allow_html=True)
         st.markdown("</div>", unsafe_allow_html=True)
@@ -1383,30 +2633,241 @@ def render_results_page():
         st.markdown("---")
 
         st.markdown("<h2 style='color: #2ecc71;'>All Detected Activities: Detailed Findings</h2>", unsafe_allow_html=True)
-        st.write("Below are all individual suspicious activities found, ordered by severity.")
+        st.write("Click any finding to expand evidence details. Use **Ask AI** for a plain-English explanation.")
 
         sorted_regular_findings = sorted(regular_findings, key=lambda x: x.get('weight', 0), reverse=True)
+        gemini_key = st.session_state.get("gemini_api_key", "")
+
+        severity_badge_colors = {
+            "critical": "#e74c3c", "high": "#ff7b72",
+            "medium": "#e3b341", "low": "#2ecc71", "informational": "#8b949e"
+        }
 
         for f in sorted_regular_findings:
+            finding_id = f.get('id', '')
             finding_severity_class = "informational"
             for band in detections_config.get('scoring', {}).get('severity_bands', []):
                 if f.get('weight', 0) <= int(band['max']):
                     finding_severity_class = band['label'].lower()
                     break
 
-            st.markdown(f"""
-            <div class="card {finding_severity_class}">
-                <h3 style='color: #2ecc71;'>{html_escape(f.get('title'))}</h3>
-                <p>Severity Score: <b>{html_escape(str(f.get('weight', 0)))}</b> | MITRE ATT&CK®: <code>{html_escape(", ".join(f.get('mitre', [])))}</code></p>
-                <div class="narrative-block">
-                    <p><b>Why it's an issue:</b> {html_escape(get_narrative(f.get('id'), detections_config))}</p>
-                </div>
-                <p><b>Supporting Evidence:</b></p>
-            </div>
-            """, unsafe_allow_html=True)
+            badge_color = severity_badge_colors.get(finding_severity_class, "#8b949e")
+            mitre_str = ", ".join(f.get('mitre', []))
+            narrative_text = get_narrative(finding_id, detections_config)
 
-            render_evidence_as_table(f.get('evidence', []), f.get('id'))
-            st.markdown("---")
+            # Expander label includes severity badge and title
+            expander_label = (
+                f"[{finding_severity_class.upper()}]  {f.get('title', finding_id)}"
+                f"  |  Score: {f.get('weight', 0)}"
+                + (f"  |  MITRE: {mitre_str}" if mitre_str else "")
+            )
+
+            with st.expander(expander_label, expanded=(finding_severity_class in ("critical", "high"))):
+                st.markdown(
+                    f"<div class='narrative-block'>"
+                    f"<p><b>Why it's an issue:</b> {html_escape(narrative_text)}</p>"
+                    f"</div>",
+                    unsafe_allow_html=True
+                )
+
+                # Ask AI button — always visible; uses local Ollama (or Gemini if key provided)
+                ai_key = f"ai_{finding_id}_{f.get('weight', 0)}"
+                col_ev, col_ai = st.columns([3, 1])
+                with col_ai:
+                    if st.button("🤖 Ask AI", key=f"btn_{ai_key}"):
+                        chosen_model = st.session_state.get("selected_model", DEFAULT_MODEL)
+                        gemini_key = st.session_state.get("gemini_api_key", "")
+
+                        # Auto-pull model if not yet downloaded (and Gemini isn't being used)
+                        if not gemini_key:
+                            pulled = get_ollama_models()
+                            if chosen_model not in pulled:
+                                with st.spinner(f"⬇️ Downloading {chosen_model} first — this may take a few minutes…"):
+                                    ok, pull_msg = pull_ollama_model(chosen_model)
+                                if not ok:
+                                    st.session_state.ai_responses[ai_key] = f"⚠️ Could not download model: {pull_msg}"
+                                    st.rerun()
+
+                        spinner_label = (
+                            "Querying Gemini…" if gemini_key
+                            else f"Querying {chosen_model} locally…"
+                        )
+                        with st.spinner(spinner_label):
+                            response = query_llm(
+                                f,
+                                model=chosen_model,
+                                gemini_key=gemini_key,
+                            )
+                            st.session_state.ai_responses[ai_key] = response
+                if ai_key in st.session_state.ai_responses:
+                    st.info(st.session_state.ai_responses[ai_key])
+                with col_ev:
+                    st.markdown("**Supporting Evidence:**")
+                    render_evidence_as_table(f.get('evidence', []), finding_id)
+
+        st.markdown("---")
+
+        # --- Report downloads ---
+        st.markdown("<h3 style='color:#2ecc71;'>Download Reports</h3>", unsafe_allow_html=True)
+        dl_col1, dl_col2 = st.columns(2)
+        report_html_path = OUTPUT_FOLDER / st.session_state.project_name / "report.html"
+        report_pdf_path  = OUTPUT_FOLDER / st.session_state.project_name / "report.pdf"
+        with dl_col1:
+            if report_html_path.exists():
+                with open(report_html_path, "rb") as rp:
+                    st.download_button(
+                        label="⬇️ Download HTML Report",
+                        data=rp.read(),
+                        file_name=f"deepprobe_{html_escape(st.session_state.project_name)}_report.html",
+                        mime="text/html",
+                        key="download_html_report",
+                        use_container_width=True,
+                    )
+            else:
+                st.button("⬇️ Download HTML Report", disabled=True, use_container_width=True)
+        with dl_col2:
+            if report_pdf_path.exists():
+                with open(report_pdf_path, "rb") as rp:
+                    st.download_button(
+                        label="📄 Download PDF Report",
+                        data=rp.read(),
+                        file_name=f"deepprobe_{html_escape(st.session_state.project_name)}_report.pdf",
+                        mime="application/pdf",
+                        key="download_pdf_report",
+                        use_container_width=True,
+                    )
+            else:
+                st.button("📄 Download PDF Report", disabled=True,
+                          help="PDF not found — re-run analysis to generate it.",
+                          use_container_width=True)
+
+    # -----------------------------------------------------------------------
+    # Attack Chain Graph tab
+    # -----------------------------------------------------------------------
+    with attack_tab:
+        st.markdown("<h2 style='color: #2ecc71;'>Interactive Attack Chain Graph</h2>", unsafe_allow_html=True)
+        st.write(
+            "Each graph shows a correlated threat chain. The **green centre node** is the shared process (PID). "
+            "Outer nodes are the individual findings linked to it. Hover over any node for details."
+        )
+        if correlated_findings:
+            sorted_cf = sorted(correlated_findings, key=lambda f: f['weight'], reverse=True)
+            for cf in sorted_cf:
+                # Determine confidence across all chains in this finding
+                # Priority: strongest confidence level wins
+                chains = cf.get("correlated_chains", [])
+                conf_levels   = {c.get("confidence", "weak") for c in chains}
+                conf_types    = {c.get("correlation_type", "") for c in chains}
+                if "strong" in conf_levels:
+                    confidence = "strong"
+                elif "medium" in conf_levels:
+                    confidence = "medium"
+                else:
+                    confidence = "weak"
+
+                _CONF_META = {
+                    "strong": ("#2ecc71", "Strong — Same Process"),
+                    "medium": ("#3498db", "Medium — Parent↔Child"),
+                    "weak":   ("#e67e22", "Weak — Behavioral Co-presence"),
+                }
+                conf_badge_color, conf_label = _CONF_META.get(confidence, ("#8b949e", confidence.title()))
+
+                st.markdown(
+                    f"<h4 style='color:#2ecc71;'>{html_escape(cf.get('title', 'Correlated Chain'))}"
+                    f"<span style='font-size:0.65em; margin-left:0.6em; background:{conf_badge_color}22; "
+                    f"color:{conf_badge_color}; border:1px solid {conf_badge_color}; "
+                    f"border-radius:4px; padding:2px 7px;'>{conf_label}</span></h4>",
+                    unsafe_allow_html=True
+                )
+                st.markdown(
+                    f"<p style='color:#c9d1d9;'>{html_escape(get_narrative(cf.get('id'), detections_config))}</p>",
+                    unsafe_allow_html=True
+                )
+                # Show explanatory note for non-strong correlations
+                if confidence in ("medium", "weak"):
+                    note = next((c.get("note","") for c in chains if c.get("note")), "")
+                    if note:
+                        st.caption(f"ℹ️ {note}")
+                render_attack_chain_graph(cf)
+
+                # ── Ask AI ── chain-aware LLM explanation
+                ai_key_cf = f"ai_cf_{cf.get('id','')}_{cf.get('weight',0)}"
+                col_graph, col_ai = st.columns([4, 1])
+                with col_ai:
+                    if st.button("🤖 Ask AI", key=f"btn_{ai_key_cf}", use_container_width=True):
+                        chosen_model = st.session_state.get("selected_model", DEFAULT_MODEL)
+                        gemini_key   = st.session_state.get("gemini_api_key", "")
+                        if not gemini_key:
+                            pulled = get_ollama_models()
+                            if chosen_model not in pulled:
+                                with st.spinner(f"⬇️ Downloading {chosen_model}…"):
+                                    ok, pull_msg = pull_ollama_model(chosen_model)
+                                if not ok:
+                                    st.session_state.ai_responses[ai_key_cf] = (
+                                        f"⚠️ Could not download model: {pull_msg}"
+                                    )
+                        spinner_label = (
+                            "Querying Gemini…" if gemini_key
+                            else f"Querying {chosen_model} locally…"
+                        )
+                        with st.spinner(spinner_label):
+                            response = query_llm_correlated(
+                                cf,
+                                model=chosen_model,
+                                gemini_key=gemini_key,
+                            )
+                            st.session_state.ai_responses[ai_key_cf] = response
+                if ai_key_cf in st.session_state.ai_responses:
+                    st.info(st.session_state.ai_responses[ai_key_cf])
+
+                st.markdown("---")
+        else:
+            st.markdown(
+                '<div class="empty-state">'
+                '<div class="es-icon">🔗</div>'
+                '<div class="es-title">No correlated attack chains found.</div>'
+                '<div class="es-sub">This may indicate isolated or low-activity findings in the memory image.<br>'
+                'Chains appear when multiple indicators share the same process ID.</div>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
+    # -----------------------------------------------------------------------
+    # Timeline tab
+    # -----------------------------------------------------------------------
+    with timeline_tab:
+        st.markdown("<h2 style='color: #2ecc71;'>Execution Timeline</h2>", unsafe_allow_html=True)
+        st.write(
+            "Reconstructs a chronological view of execution artifacts from **Shimcache** and **Amcache** "
+            "registry artifacts. Useful for establishing when suspicious programs first appeared on the system."
+        )
+        render_timeline(st.session_state.project_name)
+
+    # -----------------------------------------------------------------------
+    # MITRE ATT&CK tab
+    # -----------------------------------------------------------------------
+    with mitre_tab:
+        st.markdown("<h2 style='color: #2ecc71;'>MITRE ATT&CK® Coverage</h2>", unsafe_allow_html=True)
+        st.write(
+            "Shows which MITRE ATT&CK techniques and tactics were triggered by this analysis. "
+            "Red bars indicate techniques seen in 3+ findings."
+        )
+        render_mitre_heatmap(findings)
+
+        # Table of all triggered techniques
+        st.markdown("---")
+        st.markdown("#### Triggered Techniques Detail")
+        mitre_rows = []
+        for f in findings:
+            for tag in f.get("mitre", []):
+                mitre_rows.append({
+                    "Technique": tag,
+                    "Finding": f.get("title", f.get("id", "")),
+                    "Severity Score": f.get("weight", 0)
+                })
+        if mitre_rows:
+            df_mitre = pd.DataFrame(mitre_rows).sort_values("Severity Score", ascending=False)
+            st.dataframe(df_mitre, use_container_width=True, hide_index=True)
 
     with artifacts_tab:
         st.markdown("<h2 style='color: #2ecc71;'>Downloadable Raw Artifacts</h2>", unsafe_allow_html=True)

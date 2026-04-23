@@ -1,22 +1,25 @@
-Python specific ignores
-.venv/
-**pycache**/
+# Python
+__pycache__/
 *.pyc
+
+# Virtual env
+.venv/
+
+# Logs / DB
 *.log
 *.sqlite3
 
-# OS specific ignores
-
+# OS
 .DS_Store
 
-# IDE specific ignores
-
+# IDE
 .idea/
 .vscode/
 *.swp
 
-# DeepProbe specific ignores
-
+# App data (DO NOT COMMIT)
 out/
 memory/
 
+# Secrets
+.env
