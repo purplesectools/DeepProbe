@@ -1,135 +1,237 @@
-DeepProbe: Unmasking Hidden Threats in Memory
-Automated Memory Forensics Framework with AI-Powered Intelligence
-Introduction: Why DeepProbe?
-In today's sophisticated threat landscape, attackers often operate in memory, leaving minimal traces on disk. Traditional forensic tools can be cumbersome, slow, and require deep manual expertise, leading to missed artifacts and prolonged incident response times. DeepProbe changes the game.
+# DeepProbe
+### Automated Memory Forensics with AI-Assisted Memory Forensics and Attack Chain Analysis
 
-DeepProbe is not just another memory forensics tool; it's an intelligent, automated framework engineered to accelerate threat hunting and incident response. By integrating the power of the Volatility 3 Framework with an adaptive detection engine and AI-powered analytics, DeepProbe transforms raw memory dumps into actionable intelligence. It helps security analysts, forensic investigators, and threat hunters quickly uncover complex attack patterns, identify hidden processes, and reconstruct attack chains with unprecedented clarity.
+> **Turn a raw memory dump into a complete attack story — in minutes, not days.**
 
-What Makes DeepProbe Different?
-DeepProbe stands out through its unique blend of automation, intelligence, and user-centric design:
+DeepProbe is an open-source memory forensics platform built on [Volatility 3](https://github.com/volatilityfoundation/volatility3). It automates the most demanding parts of incident response: running plugins, correlating findings across layers, reconstructing attack chains, and generating evidence-bound AI explanations — all through a clean browser UI.
+Designed for DFIR analysts, threat hunters, and security engineers.
 
-Intelligent Correlation Engine: Instead of just listing individual findings, DeepProbe's core strength is its ability to correlate disparate forensic artifacts. It doesn't just show you a suspicious network connection; it links it to a hidden process, a code injection, and a persistence mechanism to paint a comprehensive picture of an attack. This drastically reduces false positives and highlights true threats.
+---
 
-AI-Powered Insights: DeepProbe integrates with the Gemini API to provide natural language summaries, key findings, and attack chain narratives. This feature democratizes advanced forensics, making complex findings understandable to a wider audience.
+## Why DeepProbe?
 
-Automated Contextualization: DeepProbe goes beyond raw data by automatically enriching findings with contextual information, such as IP geo-location and reputation, for immediate insights into external connections.
+Modern attackers live in memory. They inject into legitimate processes, patch kernel callbacks, disable logging, and exfiltrate data without touching disk. Catching them requires correlating dozens of Volatility outputs simultaneously — something that takes a skilled analyst hours and is easy to get wrong.
 
-Streamlined User Experience: A clean, intuitive Streamlit UI abstracts away the complexities of command-line Volatility, making powerful memory forensics accessible even for those without extensive CLI experience.
+DeepProbe automates that correlation. It classifies every finding into forensic layers (Process, Kernel, Network, System), links them by PID and parent-child relationships, detects system-wide compromise patterns, and presents the full picture as an interactive attack chain graph. When you need a plain-English explanation, local or cloud AI is one click away — with strict evidence-bound constraints so the model never hallucinates file paths or invents attack narratives.
 
-Rapid Incident Response: By automating the most time-consuming aspects of memory analysis and intelligently highlighting critical findings, DeepProbe dramatically reduces the time-to-detection and time-to-containment during a security incident.
+---
+## 🔍 Example Output
 
-Key Capabilities & Features
-Automated Memory Analysis: Leverages the robust Volatility 3 engine for deep analysis of Windows, Linux, and macOS memory dumps.
+### Attack Chain Correlation
+DeepProbe links independent findings into a single attack narrative across system layers.
 
-Adaptive Detection Engine: A YAML-configurable rule engine identifies known malicious behaviors and anomalies across various operating system artifacts.
+<img src="doc/attack_chain.png" width="800">
 
-Multi-Stage Attack Chain Reconstruction: Automatically correlates findings across processes, network connections, code injections, and persistence mechanisms to build a coherent attack narrative.
+### Analysis Summary
+High-level view of findings, severity distribution, and risk score.
 
-AI-Generated Verdicts & Summaries: Provides high-level verdicts, plain-English summaries, and detailed attack chain steps.
+<img src="doc/summary.png" width="800">
 
-Interactive Streamlit UI: Offers easy configuration of analysis jobs and real-time progress updates.
+## Feature Highlights
 
-Comprehensive Reporting: Generates detailed reports in various formats (HTML, JSONL) for documentation and further investigation.
+### Detection Engine
+- **70+ detection rules** across Windows, Linux, and macOS — all configurable in `detections.yaml`
+- Rules cover process hiding, code injection, kernel rootkits, network C2, LOLBin abuse, credential access, persistence, defence evasion, and exfiltration
+- Severity scoring with configurable bands: Informational → Low → Medium → High → Critical
+- MITRE ATT&CK tags on every rule for framework alignment
 
-IP Enrichment: Integrates with AbuseIPDB to provide geo-location and reputation context for suspicious IP addresses.
 
-Cross-Platform Support: Analyze memory dumps from Windows, Linux, and macOS systems.
 
-Getting Started
-DeepProbe runs securely within a Docker container.
 
-Prerequisites
-Docker Desktop: Install Docker Desktop for macOS, Windows, or your preferred Docker engine for Linux. Ensure it's running before proceeding.
+### Correlation Engine — Three-Tier + System-Wide
+DeepProbe's correlation engine goes well beyond PID matching:
 
-Setup Files
-Ensure the following files are in your project's root directory:
+| Tier | Method | Confidence |
+|------|--------|------------|
+| Strong | Same PID across findings | 🟢 Strong |
+| Medium | Parent → child process relationship | 🔵 Medium |
+| Weak | Behavioural co-presence across the image | 🟠 Weak |
+| System-Wide | ≥2 forensic layers with high/critical findings simultaneously | 🟣 System-Wide |
 
-Dockerfile
+The system-wide detector runs independently after all pair-based correlation — it fires when the Process, Kernel, Network, or System artifact layers each contain high-severity findings at the same time, regardless of shared PIDs.
 
-app.py
+### Modern Attack Technique Detection (8 New Engines)
+| Engine | What It Detects |
+|--------|----------------|
+| `amsi_bypass` | AMSI patching or disablement via PowerShell / cmdline |
+| `etw_patching` | ETW or Windows Event Log clearing / disablement |
+| `token_impersonation` | Non-system processes holding Token handles with impersonation rights |
+| `lateral_movement_ports` | Outbound connections on SMB (445), WinRM (5985/5986), RPC (135) |
+| `wmi_suspicious_spawn` | WmiPrvSE.exe or MMC spawning command shells |
+| `lolbin_enhanced` | Certutil, mshta, rundll32, regsvr32, msiexec used as attack proxies |
+| `archive_staging` | Archives staged in Temp/Desktop/Downloads prior to exfiltration |
+| `exfil_connections` | Processes with 5+ simultaneous outbound connections to external IPs |
 
-runner.py
+### AI-Powered Explanations
+- **Local Ollama** (Llama 3, Mistral, Phi-3 and more) — fully offline, no data leaves your machine
+- **Google Gemini** — cloud option when GPU resources are unavailable
+- **Auto-pull**: DeepProbe checks whether the selected model is downloaded and pulls it automatically if not
+- **Evidence-bound prompts**: strict constraints prevent hallucination — no invented file paths, no fabricated PIDs, no MITRE remapping, no unsafe process-termination advice
+- Dynamic narratives generated from actual findings — every explanation is specific to **this** memory image, not boilerplate
 
-requirements.txt
+### Attack Chain Visualisation
+- Interactive Plotly network graph with confidence-colour-coded centre nodes
+- Purple 🌐 system-wide node for multi-layer compromise
+- Per-finding hover showing process role, evidence summary, and co-presence flag
+- Confidence badges (Strong / Medium / Weak / System-Wide) on every chain card
 
-detections.yaml
+### Reporting
+- **PDF report** (ReportLab) — professional dark-theme with Cover, Executive Summary, High-Severity Findings, Correlated Chains, Timeline, and All Findings Reference
+- **HTML report** — standalone single-file report for sharing
+- **`findings.jsonl`** — structured findings for SIEM ingestion or custom tooling
+- **`correlated_findings.json`** — correlated chains exported separately for external analysis
 
-baseline.yaml
+### Additional Capabilities
+- Execution timeline from Shimcache and Amcache registry hive artifacts
+- MITRE ATT&CK coverage heatmap tab
+- IP enrichment with AbuseIPDB (geo-location + reputation)
+- Baseline deviation detection
+- Summary panel with live finding counts, risk score, and timeline event count
+- Cross-platform: Windows, Linux, and macOS memory dump support
 
-README.md
+---
 
-LICENSE
+## Getting Started
 
-.gitignore
+### Option 1 — Docker Compose (Recommended)
 
-.dockerignore
+The simplest way to run DeepProbe with Ollama as a sidecar (no separate Ollama installation needed):
 
-An empty memory/ subdirectory (create this if it doesn't exist)
+```bash
+git clone https://github.com/purplesectools/DeepProbe.git
+cd deepprobe
+mkdir -p memory out
+docker compose up --build
+```
 
-An empty out/ subdirectory (create this if it doesn't exist)
+Then open **http://localhost:8501** in your browser.
 
-Building the Docker Image
-Navigate to your project directory in the terminal and build the Docker image:
+The `docker-compose.yml` wires Ollama as a named service so DeepProbe can reach it at `http://ollama:11434`. The first time you select a model in the sidebar, DeepProbe will pull it automatically.
 
-docker build -t deeprobe-app .
+### Option 2 — Docker (Standalone)
 
-This command downloads the necessary base images, installs Volatility 3, sets up Python dependencies, and packages your DeepProbe application. This might take a few minutes for the first build.
+If you already have Ollama running on your host:
 
-Running the Application (Securely Local)
-To run DeepProbe and access it securely from your local machine (browser), follow these steps:
+```bash
+# Build the image
+docker build -t deepprobe-app .
 
-Create an Isolated Docker Network: This provides an additional layer of network isolation for your container.
-
+# Create an isolated network
 docker network create isolated-net
 
-Run the Container on the Isolated Network: This command ensures the application is only accessible via localhost and is not exposed on any public or network IP addresses.
+# Run the container
+docker run --rm \
+  --network=isolated-net \
+  -p 127.0.0.1:8501:8501 \
+  -v "$(pwd)/memory:/app/memory" \
+  -v "$(pwd)/out:/app/out" \
+  deepprobe-app
+```
 
-docker run --rm --network=isolated-net -p 127.0.0.1:8501:8501 \
-    -v "$(pwd)"/memory:/app/memory \
-    -v "$(pwd)"/out:/app/out \
-    deeprobe-app
+> **Security note:** The `-p 127.0.0.1:8501:8501` binding ensures the UI is only accessible from your local machine and not exposed on the network.
 
--p 127.0.0.1:8501:8501: Maps port 8501 inside the container to port 8501 on your host machine, specifically binding it to the localhost interface. This prevents external access.
+### Prerequisites
 
--v "$(pwd)"/memory:/app/memory: Mounts your local memory directory into the container. Place your memory dump files here.
+- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (macOS / Windows) or Docker Engine (Linux)
+- At least **8 GB RAM** available to the container for large memory images
+- Ollama (optional if using docker-compose — included automatically)
 
--v "$(pwd)"/out:/app/out: Mounts your local out directory into the container. Analysis results and reports will be saved here.
+---
 
---rm: Automatically removes the container once it exits.
+## Using DeepProbe
 
---network=isolated-net: Connects the container to the isolated network you created, enhancing security.
+1. **Place your memory image** in the `memory/` folder (e.g. `memory/workstation.raw`)
+2. **Open the UI** at `http://localhost:8501`
+3. **Configure analysis** in the sidebar:
+   - Enter a **Project Name** and the **Memory File Name**
+   - Optionally add an **AbuseIPDB API key** for IP enrichment
+   - Optionally add a **Gemini API key** for cloud AI explanations
+   - Select your **local Ollama model** (or let DeepProbe pull one)
+4. **Click Launch Analysis**
+5. **Explore the results** across five tabs:
+   - 📋 **Analysis Report** — verdict, severity chart, attack story, findings narrative, detailed findings with Ask AI
+   - 🕸️ **Attack Chain Graph** — interactive correlation network with confidence badges
+   - ⏱️ **Timeline** — shimcache/amcache execution timeline
+   - 🎯 **MITRE ATT&CK** — technique coverage mapped to findings
+   - 📁 **Raw Artifacts** — full Volatility plugin output
 
-Accessing the UI
-Once the container is running, open your web browser and navigate to:
+---
 
-http://localhost:8501
+## Output Files
 
-You should see the DeepProbe UI ready for use.
+All output is written to `out/<PROJECT_NAME>/` on your host machine:
 
-Using DeepProbe
-Place Memory Image: Copy your memory dump file (e.g., my_workstation.raw) into the memory/ folder in your project directory (on your host machine).
+| File | Description |
+|------|-------------|
+| `findings.jsonl` | All findings as newline-delimited JSON |
+| `correlated_findings.json` | Correlated attack chains only |
+| `report.html` | Standalone HTML report |
+| `report.pdf` | Professional PDF report |
+| `artifacts/` | Raw Volatility plugin CSV and text output |
 
-Configure Analysis: In the UI, enter a Project Name and the Memory File Name (e.g., my_workstation.raw).
+---
 
-API Keys (Optional):
+## Configuration
 
-AbuseIPDB API Key: Provide an API key from AbuseIPDB for IP geo-location and reputation analysis.
+### Detection Rules — `detections.yaml`
 
-Gemini API Key: Provide your Gemini API key to enable AI-generated summaries and verdicts.
+Every detection rule is defined in `detections.yaml`. Rules specify:
+- `id`, `title`, `narrative` — identification and display
+- `weight` — contributes to the overall risk score
+- `mitre` — MITRE ATT&CK technique IDs
+- `engine` — which analysis function handles this rule
+- `enabled` — toggle rules on/off without deleting them
+- `params` — engine-specific parameters (thresholds, patterns, allowlists)
 
-Launch Analysis: Click Launch Analysis to start the automated forensic scan.
+### Baseline — `baseline.yaml`
 
-Review Results: Once the scan is complete, explore the "Report Summary", "Findings", and "Artifacts" tabs for detailed insights and AI narratives.
+Define your environment's expected state: trusted processes, known network ranges, allowed ports, and expected module lists. DeepProbe uses the baseline to suppress expected activity and surface genuine anomalies.
 
-Output & Reporting
-All generated analysis reports, detailed findings (JSONL), and raw artifact files from Volatility plugins will be saved in the out/<PROJECT_NAME>/ directory on your host machine. This allows for offline review and integration with other tools.
+### AI Model Selection
 
-License
-DeepProbe is a wrapper built on the Volatility 3 Framework, and as such, it is licensed under the Volatility Software License (VSL), Version 1.0.
+DeepProbe ships with a curated list of recommended Ollama models:
 
-The VSL is a copyleft license that requires any additions or wrappers built on the Volatility Framework to also be made publicly available under the same license. This ensures the project remains open and accessible to all.
+| Model | Size | Notes |
+|-------|------|-------|
+| `llama3.2:3b` | ~2 GB | Fast, works on any machine |
+| `llama3.1:8b` | ~5 GB | Better reasoning |
+| `mistral:7b` | ~4 GB | Excellent instruction following |
+| `phi3:mini` | ~2.3 GB | Lightest option |
+| `gemma2:2b` | ~1.6 GB | Very lightweight |
 
-A full copy of the license is available in the LICENSE file in this repository.
+Select your model in the sidebar. If it isn't downloaded yet, DeepProbe will pull it before running the first query.
 
-Contributing
-We welcome contributions from the community! If you'd like to improve DeepProbe, please refer to our CONTRIBUTING.md (coming soon!) for guidelines on how to report bugs, suggest features, and submit pull requests.
+---
+
+## Project Structure
+
+```
+deepprobe/
+├── app.py              # Streamlit UI and AI integration
+├── runner.py           # Volatility wrapper, detection engines, correlation, PDF generation
+├── detections.yaml     # Detection rules, scoring bands, OS profiles
+├── baseline.yaml       # Environment baseline for deviation detection
+├── requirements.txt    # Python dependencies
+├── Dockerfile          # Container definition
+├── docker-compose.yml  # DeepProbe + Ollama compose stack
+├── memory/             # Place memory dump files here
+└── out/                # Analysis output (auto-created)
+```
+
+---
+
+## License
+
+DeepProbe is a wrapper built on the [Volatility 3 Framework](https://github.com/volatilityfoundation/volatility3) and is distributed under the **Volatility Software License (VSL), Version 1.0** — a copyleft license requiring that additions and wrappers built on the Volatility Framework be made publicly available under the same terms.
+
+A full copy of the license is available in the [`LICENSE`](./LICENSE) file.
+
+---
+
+## Contributing
+
+Contributions are welcome — bug reports, new detection rules, engine improvements, and UI enhancements alike. A `CONTRIBUTING.md` with full guidelines is coming soon. In the meantime, open an issue or submit a pull request and we'll review it promptly.
+
+---
+
+*DeepProbe — built for analysts who need answers, not more data.*
