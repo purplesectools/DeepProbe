@@ -1,9 +1,9 @@
 # DeepProbe
 ### Automated Memory Forensics with AI-Assisted Memory Forensics and Attack Chain Analysis
 
-> **Turn a raw memory dump into a complete attack story — in minutes, not days.**
+> **Turn a raw memory dump into a complete attack story, in minutes, not days.**
 
-DeepProbe is an open-source memory forensics platform built on [Volatility 3](https://github.com/volatilityfoundation/volatility3). It automates the most demanding parts of incident response: running plugins, correlating findings across layers, reconstructing attack chains, and generating evidence-bound AI explanations — all through a clean browser UI.
+DeepProbe is an open-source memory forensics platform built on [Volatility 3](https://github.com/volatilityfoundation/volatility3). It automates the most demanding parts of incident response: running plugins, correlating findings across layers, reconstructing attack chains, and generating evidence-bound AI explanations; all through a clean browser UI.
 Designed for DFIR analysts, threat hunters, and security engineers.
 
 ---
