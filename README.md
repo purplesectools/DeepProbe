@@ -10,9 +10,9 @@ Designed for DFIR analysts, threat hunters, and security engineers.
 
 ## Why DeepProbe?
 
-Modern attackers live in memory. They inject into legitimate processes, patch kernel callbacks, disable logging, and exfiltrate data without touching disk. Catching them requires correlating dozens of Volatility outputs simultaneously — something that takes a skilled analyst hours and is easy to get wrong.
+Modern attackers live in memory. They inject into legitimate processes, patch kernel callbacks, disable logging, and exfiltrate data without touching disk. Catching them requires correlating dozens of Volatility outputs simultaneously;s omething that takes a skilled analyst hours and is easy to get wrong.
 
-DeepProbe automates that correlation. It classifies every finding into forensic layers (Process, Kernel, Network, System), links them by PID and parent-child relationships, detects system-wide compromise patterns, and presents the full picture as an interactive attack chain graph. When you need a plain-English explanation, local or cloud AI is one click away — with strict evidence-bound constraints so the model never hallucinates file paths or invents attack narratives.
+DeepProbe automates that correlation. It classifies every finding into forensic layers (Process, Kernel, Network, System), links them by PID and parent-child relationships, detects system-wide compromise patterns, and presents the full picture as an interactive attack chain graph. When you need a plain-English explanation, local or cloud AI is one click away with strict evidence-bound constraints so the model never hallucinates file paths or invents attack narratives.
 
 ---
 ## 🔍 Example Output
