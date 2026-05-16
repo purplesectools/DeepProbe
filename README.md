@@ -255,4 +255,11 @@ Contributions are welcome — bug reports, new detection rules, engine improveme
 
 ---
 
-*DeepProbe — built for analysts who need answers, not more data.*
+## Attribution & Relationship to Volatility
+
+DeepProbe is an independent community project built on top of the Volatility 3 framework.
+
+Volatility and Volatility 3 are developed by the Volatility Foundation:
+https://github.com/volatilityfoundation/volatility3
+
+DeepProbe is not officially affiliated with or endorsed by the Volatility Foundation.
